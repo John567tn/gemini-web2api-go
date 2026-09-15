@@ -452,7 +452,7 @@ const pages = {
                     title="本地 RPH 限额 ${limit}"></div>` : ''}
                 </div>
                 <div class="slot-note ${noteCls}">${note} · 并发 ${u.inflight}/${u.limit_concurrent || '∞'}
-                  · RPM ${u.rpm}/${u.limit_rpm || '∞'}</div>
+                  · RPM ${u.rpm}/${u.limit_rpm || '∞'} · RPH ${rph}/${u.limit_rph || '∞'}</div>
               </div>`;
             }).join('') || '<div class="empty">还没有任何请求经过</div>'}
           </div>
@@ -918,7 +918,7 @@ const RT_GROUPS = [
       { k: 'per_ip_rpm', label: 'RPM', type: 'int', min: 0, max: 10000,
         hint: '滚动 60 秒窗口上限，0=不限' },
       { k: 'per_ip_rph', label: 'RPH', type: 'int', min: 0, max: 100000,
-        hint: '滚动 1 小时上限。实测单出口 80-180 次被拦，默认取下沿 80。按低速率跑可以调高很多——10 次/分钟连打 800 次没被拦过' },
+        hint: '滚动 1 小时上限，0=不限。实测单出口 80-180 次被拦，默认取下沿 80。按低速率跑可以调高很多——10 次/分钟连打 800 次没被拦过' },
     ],
   },
   {
