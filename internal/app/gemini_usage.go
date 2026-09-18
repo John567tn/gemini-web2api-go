@@ -158,29 +158,26 @@ func cachedGeminiUsage(a CookieAccount, force bool) (*geminiUsageSnapshot, error
 }
 
 func fetchGeminiUsageLive(a CookieAccount) (*geminiUsageSnapshot, error) {
+	// Usage is observational.  It may refresh the Google session cookie below,
+	// but it must never call markCookieByStatus/markAccountResult: a quota probe
+	// is not a model request and must not reorder, disable, or heal the routing
+	// account pool.
 	picked, ok, err := acquireSlot(a.ProxyID)
 	if !ok {
 		return nil, err
 	}
 	defer releaseSlot(picked.ID)
 	proxyURL := picked.URL
-	if a.ProxyID == 0 || !proxyUsableByID(a.ProxyID) {
-		bindAccountProxy(a.ID, picked.ID)
-	}
 
 	page, err := fetchAppPage(a.Cookie, proxyURL)
 	if err != nil {
 		if isGeminiUsageAuthFailure(err) {
-			markCookieByStatus(a.ID, 401, "Google session expired")
 			return nil, newGeminiUsageAuthError(err)
 		}
 		return nil, err
 	}
 	tokens, err := extractGeminiUsagePageTokens(page)
 	if err != nil {
-		if isGeminiUsageAuthFailure(err) {
-			markCookieByStatus(a.ID, 401, "Google session expired")
-		}
 		return nil, err
 	}
 
@@ -217,7 +214,6 @@ func fetchGeminiUsageLive(a CookieAccount) (*geminiUsageSnapshot, error) {
 		return nil, err
 	}
 	if status == 401 || status == 403 || status == 302 {
-		markCookieByStatus(a.ID, status, "Google session expired")
 		return nil, geminiUsageHTTPError(status)
 	}
 	if status != 200 {
@@ -230,7 +226,6 @@ func fetchGeminiUsageLive(a CookieAccount) (*geminiUsageSnapshot, error) {
 		logf("[gemini-usage] account #%d parse failed: %v shape=%s", a.ID, err, usageShape(raw))
 		return nil, newGeminiUsageProtocolError("Gemini Apps usage response could not be parsed", err)
 	}
-	markCookieByStatus(a.ID, 200, "")
 	return &geminiUsageSnapshot{
 		AccountID:    a.ID,
 		AccountLabel: a.Label,
@@ -522,7 +517,7 @@ func usageWindowListCandidate(arr []interface{}) (int, [][]interface{}, bool) {
 }
 
 func usageWindowShape(w []interface{}) int {
-	if len(w) >= 6 && usageNumberAt(w, 4) && usageTimestampArray(w[5]) &&
+	if len(w) >= 8 && usageNumberAt(w, 4) && usageTimestampArray(w[5]) &&
 		usageNullableAt(w, 6) && usageNullableAt(w, 7) {
 		return usageSchemaB
 	}

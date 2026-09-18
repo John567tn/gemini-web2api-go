@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -133,7 +134,7 @@ func TestParseGeminiUsageExhaustedAndFullRemaining(t *testing.T) {
 }
 
 func TestParseGeminiUsageMissingMetricDoesNotBecomeZero(t *testing.T) {
-	five := []interface{}{"x", "x", "x", "x", float64(1), []interface{}{1710000100.0}}
+	five := []interface{}{"x", "x", "x", "x", float64(1), []interface{}{1710000100.0}, nil, nil}
 	weekly := schemaBWindow(2, nil, 96.8, 1710000200)
 	windows, err := parseGeminiUsageRPC(usageRPCFixture(t, usagePayload(five, weekly), false))
 	if err == nil || windows != nil || !strings.Contains(err.Error(), "neither used nor remaining") {
@@ -199,16 +200,79 @@ func TestGeminiUsageCacheIsolatedByAccount(t *testing.T) {
 	}
 }
 
-type fakeGoogleLoginBrowser struct {
-	cookies []browserCookie
-	closed  atomic.Bool
+func TestGeminiUsageIsObservationalForAccountHealth(t *testing.T) {
+	id, err := accountAdd("usage-observe", "SAPISID=usage; __Secure-1PSID=usage-psid", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = accountDelete(id) })
+	_, err = getDB().Exec(`UPDATE accounts SET fail_count=2, last_error='model request failed', status='enabled' WHERE id=?`, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	oldFetcher := geminiUsageFetcher
+	t.Cleanup(func() { geminiUsageFetcher = oldFetcher })
+	geminiUsageFetcher = func(a CookieAccount) (*geminiUsageSnapshot, error) {
+		return &geminiUsageSnapshot{
+			AccountID: a.ID,
+			Windows: map[int]geminiUsageWindow{
+				1: {UsedPercent: 10, RemainingPercent: 90, ResetAt: time.Unix(1710000100, 0)},
+				2: {UsedPercent: 20, RemainingPercent: 80, ResetAt: time.Unix(1710000200, 0)},
+			},
+			FetchedAt: time.Now().UTC(),
+		}, nil
+	}
+	invalidateGeminiUsageCache(id)
+	item := geminiUsageItem(*accountByID(id), true)
+	if item["status"] != "ok" {
+		t.Fatalf("usage success failed: %+v", item)
+	}
+	after := accountByID(id)
+	if after.FailCount != 2 || after.LastError != "model request failed" || after.Status != "enabled" {
+		t.Fatalf("usage success changed routing health: %+v", after)
+	}
+
+	if _, err := getDB().Exec(`UPDATE accounts SET fail_count=0, last_error='', status='enabled' WHERE id=?`, id); err != nil {
+		t.Fatal(err)
+	}
+	geminiUsageFetcher = func(CookieAccount) (*geminiUsageSnapshot, error) {
+		return nil, geminiUsageHTTPError(403)
+	}
+	invalidateGeminiUsageCache(id)
+	item = geminiUsageItem(*accountByID(id), true)
+	if item["status"] != "auth_session_expired" {
+		t.Fatalf("usage 403 was not classified as usage auth expiry: %+v", item)
+	}
+	after = accountByID(id)
+	if after.FailCount != 0 || after.LastError != "" || after.Status != "enabled" {
+		t.Fatalf("usage error changed routing health: %+v", after)
+	}
 }
 
-func (b *fakeGoogleLoginBrowser) Navigate(context.Context, string) error { return nil }
+type fakeGoogleLoginBrowser struct {
+	cookies     []browserCookie
+	navigateErr error
+	cookieErr   error
+	closed      atomic.Bool
+	closeCount  atomic.Int32
+	closeOnce   sync.Once
+}
+
+func (b *fakeGoogleLoginBrowser) Navigate(context.Context, string) error { return b.navigateErr }
 func (b *fakeGoogleLoginBrowser) Cookies(context.Context) ([]browserCookie, error) {
+	if b.cookieErr != nil {
+		return nil, b.cookieErr
+	}
 	return b.cookies, nil
 }
-func (b *fakeGoogleLoginBrowser) Close() error { b.closed.Store(true); return nil }
+func (b *fakeGoogleLoginBrowser) Close() error {
+	b.closeOnce.Do(func() {
+		b.closed.Store(true)
+		b.closeCount.Add(1)
+	})
+	return nil
+}
 
 func TestGoogleLoginStateMachineUsesMockBrowser(t *testing.T) {
 	oldPoll := googleLoginPollInterval
@@ -223,8 +287,8 @@ func TestGoogleLoginStateMachineUsesMockBrowser(t *testing.T) {
 	}}
 	m := newGoogleLoginManager(
 		func(context.Context, string, string) (googleLoginBrowser, error) { return fake, nil },
-		func(cookie string) (googleSessionValidation, error) {
-			if !hasNativeGoogleLoginCookies(cookie) {
+		func(req googleSessionValidationRequest) (googleSessionValidation, error) {
+			if !hasNativeGoogleLoginCookies(req.Cookie) {
 				return googleSessionValidation{}, errors.New("missing cookies")
 			}
 			return googleSessionValidation{}, nil
@@ -246,6 +310,10 @@ func TestGoogleLoginStateMachineUsesMockBrowser(t *testing.T) {
 			if view["account_id"].(int64) <= 0 || !fake.closed.Load() {
 				t.Fatalf("mock login succeeded without account/browser cleanup: %+v closed=%v", view, fake.closed.Load())
 			}
+			if fake.closeCount.Load() != 1 {
+				t.Fatalf("mock login closed browser %d times, want 1", fake.closeCount.Load())
+			}
+			waitForProfileGone(t, s.profileDir)
 			_ = accountDelete(view["account_id"].(int64))
 			return
 		}

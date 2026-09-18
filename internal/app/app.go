@@ -72,6 +72,7 @@ func Run() {
 	if envTok := os.Getenv("ADMIN_TOKEN"); envTok != "" && cfg.AdminToken == "" {
 		cfg.AdminToken = envTok
 	}
+	cleanupOrphanGoogleBrowserProfiles(googleBrowserProfileRoot(), time.Now())
 
 	// boot DB and load proxy pool
 	getDB()

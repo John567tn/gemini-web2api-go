@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -23,12 +24,17 @@ import (
 )
 
 const (
-	googleLoginURL       = "https://gemini.google.com/app"
-	googleLoginTTL       = 10 * time.Minute
-	googleLoginKeepAlive = 5 * time.Minute
+	googleLoginURL           = "https://gemini.google.com/app"
+	googleLoginTTL           = 10 * time.Minute
+	googleLoginKeepAlive     = 5 * time.Minute
+	googleLoginProfileMarker = ".gemini-web2api-login-profile"
+	googleLoginOrphanAge     = googleLoginTTL + googleLoginKeepAlive
 )
 
-var googleLoginPollInterval = 2 * time.Second
+var (
+	googleLoginPollInterval          = 2 * time.Second
+	googleLoginValidationRetryWindow = 5 * time.Second
+)
 
 const (
 	googleLoginLaunching  = "launching"
@@ -58,11 +64,19 @@ type googleLoginBrowser interface {
 
 type googleLoginBrowserFactory func(context.Context, string, string) (googleLoginBrowser, error)
 
-type googleSessionValidation struct {
-	ProxyID int64
+type googleSessionValidationRequest struct {
+	Cookie           string
+	TargetAccountID  int64
+	PreferredProxyID int64
 }
 
-type googleSessionValidator func(string) (googleSessionValidation, error)
+type googleSessionValidation struct {
+	ProxyID       int64
+	ProxyFallback bool
+	Warning       string
+}
+
+type googleSessionValidator func(googleSessionValidationRequest) (googleSessionValidation, error)
 
 type googleLoginManager struct {
 	mu        sync.Mutex
@@ -83,6 +97,7 @@ type googleLoginSession struct {
 	accountID   int64
 	label       string
 	note        string
+	warning     string
 	startedAt   time.Time
 	expiresAt   time.Time
 	finishedAt  time.Time
@@ -119,18 +134,28 @@ func (m *googleLoginManager) start(label, note string, targetAccountID int64) (*
 	if err := os.MkdirAll(profileDir, 0o700); err != nil {
 		return nil, fmt.Errorf("create browser profile: %w", err)
 	}
+	if err := os.WriteFile(filepath.Join(profileDir, googleLoginProfileMarker), []byte("gemini-web2api native login profile\n"), 0o600); err != nil {
+		_ = os.RemoveAll(profileDir)
+		return nil, fmt.Errorf("mark browser profile: %w", err)
+	}
+	warning := googleLoginNetworkWarning()
+	message := "正在启动受控浏览器；请只在 Google 页面中完成登录"
+	if warning != "" {
+		message += "；警告：" + warning
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), googleLoginTTL)
 	s := &googleLoginSession{
 		manager:     m,
 		id:          id,
 		state:       googleLoginLaunching,
-		message:     "正在启动受控浏览器；请只在 Google 页面中完成登录",
+		message:     message,
 		browserName: browserName,
 		profileDir:  profileDir,
 		accountID:   targetAccountID,
 		label:       strings.TrimSpace(label),
 		note:        strings.TrimSpace(note),
+		warning:     warning,
 		startedAt:   time.Now(),
 		expiresAt:   time.Now().Add(googleLoginTTL),
 		cancel:      cancel,
@@ -169,6 +194,7 @@ func (s *googleLoginSession) run(ctx context.Context, executable string) {
 		s.fail("受控浏览器启动失败")
 		if cleanupErr := removeGoogleBrowserProfile(s.profileDir); cleanupErr != nil {
 			logf("[google-login] browser profile cleanup failed: %v", cleanupErr)
+			scheduleGoogleBrowserProfileCleanup(s.profileDir)
 		}
 		s.cleanupLater()
 		return
@@ -180,6 +206,7 @@ func (s *googleLoginSession) run(ctx context.Context, executable string) {
 		_ = browser.Close()
 		if err := removeGoogleBrowserProfile(s.profileDir); err != nil {
 			logf("[google-login] browser profile cleanup failed: %v", err)
+			scheduleGoogleBrowserProfileCleanup(s.profileDir)
 		}
 		s.cleanupLater()
 	}()
@@ -221,7 +248,7 @@ func (s *googleLoginSession) run(ctx context.Context, executable string) {
 
 		fingerprint := cookieKey(cookie)
 		s.mu.Lock()
-		shouldValidate := fingerprint != s.lastFingerprint || time.Since(s.lastValidation) >= 5*time.Second
+		shouldValidate := fingerprint != s.lastFingerprint || time.Since(s.lastValidation) >= googleLoginValidationRetryWindow
 		if shouldValidate {
 			s.lastFingerprint = fingerprint
 			s.lastValidation = time.Now()
@@ -232,20 +259,30 @@ func (s *googleLoginSession) run(ctx context.Context, executable string) {
 		}
 
 		s.setState(googleLoginValidating, "已检测到 Google session，正在验证 Gemini Web 登录态")
-		validation, err := s.manager.validator(cookie)
+		preferredProxyID := int64(0)
+		if s.accountID > 0 {
+			if account := accountByID(s.accountID); account != nil {
+				preferredProxyID = account.ProxyID
+			}
+		}
+		validation, err := s.manager.validator(googleSessionValidationRequest{
+			Cookie:           cookie,
+			TargetAccountID:  s.accountID,
+			PreferredProxyID: preferredProxyID,
+		})
 		if err != nil {
 			// 不把上游错误原文写进状态或日志：它可能包含部署相关的请求细节。
 			s.setState(googleLoginWaiting, "登录态尚未验证成功，请在 Google 页面完成登录后稍候")
 			continue
 		}
 
-		accountID, err := adoptGoogleLogin(cookie, s.accountID, s.label, s.note, validation.ProxyID)
+		accountID, err := adoptGoogleLogin(cookie, s.accountID, s.label, s.note, validation)
 		if err != nil {
 			s.fail("Google session 已验证，但写入本地账号池失败")
 			return
 		}
 		_ = browser.Close()
-		s.succeed(accountID)
+		s.succeed(accountID, validation.Warning)
 		return
 	}
 }
@@ -260,14 +297,19 @@ func (s *googleLoginSession) setState(state, message string) {
 	s.message = message
 }
 
-func (s *googleLoginSession) succeed(accountID int64) {
+func (s *googleLoginSession) succeed(accountID int64, warning string) {
 	s.mu.Lock()
 	if isGoogleLoginTerminal(s.state) {
 		s.mu.Unlock()
 		return
 	}
 	s.state = googleLoginSucceeded
+	warning = combineGoogleLoginWarnings(s.warning, warning)
+	s.warning = warning
 	s.message = "Google 登录成功，浏览器窗口已关闭，账号已加入本地账号池"
+	if warning != "" {
+		s.message += "；警告：" + warning
+	}
 	s.accountID = accountID
 	s.finishedAt = time.Now()
 	s.mu.Unlock()
@@ -340,6 +382,7 @@ func (s *googleLoginSession) view() map[string]interface{} {
 		"message":    s.message,
 		"browser":    s.browserName,
 		"account_id": s.accountID,
+		"warning":    s.warning,
 		"started_at": s.startedAt.UTC().Format(time.RFC3339),
 		"expires_at": s.expiresAt.UTC().Format(time.RFC3339),
 		"finished_at": func() string {
@@ -424,13 +467,37 @@ func handleGoogleLoginSession(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// Native login is a browser-sensitive local capability.  Do not use
+// Forwarded/X-Forwarded-* here: a client can provide those headers, and a
+// reverse proxy can make a remote request appear loopback to the backend.
+// The Host/origin checks below intentionally make public-domain proxying
+// fail closed while still allowing a local curl request without Origin.
 func isLocalAdminRequest(r *http.Request) bool {
 	remote := strings.TrimSpace(r.RemoteAddr)
+	if !isLoopbackRemoteAddr(remote) {
+		return false
+	}
+	if !isLocalBrowserHost(r.Host) {
+		return false
+	}
+	if origin := strings.TrimSpace(r.Header.Get("Origin")); origin != "" {
+		if strings.EqualFold(origin, "null") || !isLocalBrowserOrigin(origin) {
+			return false
+		}
+	}
+	if fetchSite := strings.ToLower(strings.TrimSpace(r.Header.Get("Sec-Fetch-Site"))); fetchSite != "" {
+		for _, token := range strings.Split(fetchSite, ",") {
+			if strings.TrimSpace(token) == "cross-site" {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func isLoopbackRemoteAddr(remote string) bool {
 	if remote == "" {
-		// httptest and Unix-socket adapters may not populate RemoteAddr.  The
-		// production net/http server always does, and unknown proxy headers are
-		// deliberately not trusted for this security boundary.
-		return true
+		return false
 	}
 	host, _, err := net.SplitHostPort(remote)
 	if err != nil || host == "" {
@@ -438,6 +505,34 @@ func isLocalAdminRequest(r *http.Request) bool {
 	}
 	ip := net.ParseIP(host)
 	return ip != nil && ip.IsLoopback()
+}
+
+func isLocalBrowserHost(hostPort string) bool {
+	hostPort = strings.TrimSpace(hostPort)
+	if hostPort == "" {
+		return false
+	}
+	host := hostPort
+	if parsedHost, _, err := net.SplitHostPort(hostPort); err == nil {
+		host = parsedHost
+	} else {
+		host = strings.Trim(host, "[]")
+	}
+	return isLocalHostName(host)
+}
+
+func isLocalBrowserOrigin(raw string) bool {
+	u, err := url.Parse(raw)
+	if err != nil || u.Scheme == "" || u.Host == "" || u.User != nil || u.Path != "" || u.RawQuery != "" || u.Fragment != "" {
+		return false
+	}
+	return isLocalHostName(u.Hostname())
+}
+
+func isLocalHostName(host string) bool {
+	host = strings.TrimSuffix(strings.ToLower(strings.TrimSpace(host)), ".")
+	host = strings.Trim(host, "[]")
+	return host == "localhost" || host == "127.0.0.1" || host == "::1"
 }
 
 // browserProfileRoot keeps the browser profile next to the configured data
@@ -467,6 +562,63 @@ func removeGoogleBrowserProfile(profileDir string) error {
 		time.Sleep(100 * time.Millisecond)
 	}
 	return err
+}
+
+func scheduleGoogleBrowserProfileCleanup(profileDir string) {
+	if profileDir == "" {
+		return
+	}
+	go func() {
+		deadline := time.Now().Add(15 * time.Minute)
+		delay := 250 * time.Millisecond
+		for {
+			if err := os.RemoveAll(profileDir); err == nil {
+				return
+			}
+			if time.Now().After(deadline) {
+				logf("[google-login] browser profile cleanup still pending after retry window")
+				return
+			}
+			time.Sleep(delay)
+			if delay < 5*time.Second {
+				delay *= 2
+			}
+		}
+	}()
+}
+
+// cleanupOrphanGoogleBrowserProfiles removes only direct child directories
+// carrying our marker (or legacy UUID names from the first implementation).
+// The age threshold prevents a service restart from deleting an active login
+// profile that was created moments ago.
+func cleanupOrphanGoogleBrowserProfiles(root string, now time.Time) int {
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return 0
+	}
+	removed := 0
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		profileDir := filepath.Join(root, entry.Name())
+		info, err := entry.Info()
+		if err != nil || now.Sub(info.ModTime()) < googleLoginOrphanAge {
+			continue
+		}
+		marker := filepath.Join(profileDir, googleLoginProfileMarker)
+		_, markerErr := os.Stat(marker)
+		_, uuidErr := uuid.Parse(entry.Name())
+		if markerErr != nil && uuidErr != nil {
+			continue
+		}
+		if err := removeGoogleBrowserProfile(profileDir); err == nil {
+			removed++
+		} else {
+			scheduleGoogleBrowserProfileCleanup(profileDir)
+		}
+	}
+	return removed
 }
 
 type browserCandidate struct {
@@ -537,25 +689,59 @@ type chromedpGoogleBrowser struct {
 	ctx           context.Context
 	browserCancel context.CancelFunc
 	allocCancel   context.CancelFunc
+	process       *exec.Cmd
 	closeOnce     sync.Once
 }
 
 func launchChromedpBrowser(parent context.Context, executable, profileDir string) (googleLoginBrowser, error) {
-	allocCtx, allocCancel := chromedp.NewExecAllocator(parent,
-		chromedp.ExecPath(executable),
-		chromedp.UserDataDir(profileDir),
-		chromedp.Flag("headless", false),
-		chromedp.Flag("remote-debugging-address", "127.0.0.1"),
-		chromedp.Flag("remote-debugging-port", 0),
-		chromedp.Flag("no-first-run", true),
-		chromedp.Flag("no-default-browser-check", true),
-	)
-	browserCtx, browserCancel := chromedp.NewContext(allocCtx)
+	// chromedp v0.14.2's DefaultExecAllocatorOptions include
+	// --enable-automation and default --remote-debugging-port=0.  Launch the
+	// normal installed browser ourselves, without those defaults, then attach
+	// chromedp through a loopback-only, non-zero ephemeral port.
+	port, err := allocateLoopbackCDPPort()
+	if err != nil {
+		return nil, err
+	}
+	cmd := exec.CommandContext(parent, executable, googleBrowserCommandArgs(profileDir, port)...)
+	cmd.Stdout = io.Discard
+	cmd.Stderr = io.Discard
+	if err := cmd.Start(); err != nil {
+		return nil, fmt.Errorf("start browser: %w", err)
+	}
+	go func() { _ = cmd.Wait() }()
+
+	endpoint := fmt.Sprintf("http://127.0.0.1:%d", port)
+	remoteCtx, allocCancel := chromedp.NewRemoteAllocator(parent, endpoint)
+	browserCtx, browserCancel := chromedp.NewContext(remoteCtx)
 	return &chromedpGoogleBrowser{
 		ctx:           browserCtx,
 		browserCancel: browserCancel,
 		allocCancel:   allocCancel,
+		process:       cmd,
 	}, nil
+}
+
+func allocateLoopbackCDPPort() (int, error) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return 0, fmt.Errorf("allocate loopback CDP port: %w", err)
+	}
+	defer listener.Close()
+	addr, ok := listener.Addr().(*net.TCPAddr)
+	if !ok || addr.Port <= 0 {
+		return 0, errors.New("allocate loopback CDP port: invalid listener address")
+	}
+	return addr.Port, nil
+}
+
+func googleBrowserCommandArgs(profileDir string, port int) []string {
+	return []string{
+		"--user-data-dir=" + profileDir,
+		"--remote-debugging-address=127.0.0.1",
+		fmt.Sprintf("--remote-debugging-port=%d", port),
+		"--no-first-run",
+		"--no-default-browser-check",
+	}
 }
 
 func (b *chromedpGoogleBrowser) Navigate(ctx context.Context, target string) error {
@@ -578,6 +764,9 @@ func (b *chromedpGoogleBrowser) Close() error {
 	b.closeOnce.Do(func() {
 		b.browserCancel()
 		b.allocCancel()
+		if b.process != nil && b.process.Process != nil {
+			_ = b.process.Process.Kill()
+		}
 	})
 	return nil
 }
@@ -626,26 +815,32 @@ func hasNativeGoogleLoginCookies(cookie string) bool {
 		cookieValue(cookie, "__Secure-1PSIDTS") != ""
 }
 
-func validateGoogleLoginCookie(cookie string) (googleSessionValidation, error) {
-	if !hasNativeGoogleLoginCookies(cookie) {
+func validateGoogleLoginCookie(req googleSessionValidationRequest) (googleSessionValidation, error) {
+	if !hasNativeGoogleLoginCookies(req.Cookie) {
 		return googleSessionValidation{}, errors.New("required Google session cookies are missing")
 	}
-	picked, ok, err := acquireSlot(0)
+	picked, ok, err := acquireSlot(req.PreferredProxyID)
 	if !ok {
 		return googleSessionValidation{}, err
 	}
 	defer releaseSlot(picked.ID)
-	entry, err := fetchAppTokens(cookie, picked.URL)
+	entry, err := fetchAppTokens(req.Cookie, picked.URL)
 	if err != nil {
 		return googleSessionValidation{}, err
 	}
 	if entry.token == "" {
 		return googleSessionValidation{}, errors.New("Gemini /app did not return SNlM0e")
 	}
-	return googleSessionValidation{ProxyID: picked.ID}, nil
+	validation := googleSessionValidation{ProxyID: picked.ID}
+	if req.PreferredProxyID > 0 && picked.ID != req.PreferredProxyID {
+		validation.ProxyFallback = true
+		validation.Warning = googleLoginProxyFallbackWarning(req.PreferredProxyID, picked.ID)
+		logf("[google-login] account #%d validation used proxy fallback: preferred=%d selected=%d", req.TargetAccountID, req.PreferredProxyID, picked.ID)
+	}
+	return validation, nil
 }
 
-func adoptGoogleLogin(cookie string, targetAccountID int64, label, note string, proxyID int64) (int64, error) {
+func adoptGoogleLogin(cookie string, targetAccountID int64, label, note string, validation googleSessionValidation) (int64, error) {
 	cookie, ok := normalizeCookie(cookie, "native Google login")
 	if !ok || !hasNativeGoogleLoginCookies(cookie) {
 		return 0, errors.New("validated Google session cookie is incomplete")
@@ -659,7 +854,7 @@ func adoptGoogleLogin(cookie string, targetAccountID int64, label, note string, 
 		if err := accountReplaceCookie(targetAccountID, cookie, label); err != nil {
 			return 0, err
 		}
-		bindAccountProxy(targetAccountID, proxyID)
+		bindAccountProxy(targetAccountID, validation.ProxyID)
 		invalidateXSRF(cookie)
 		invalidateGeminiUsageCache(targetAccountID)
 		return targetAccountID, nil
@@ -670,7 +865,7 @@ func adoptGoogleLogin(cookie string, targetAccountID int64, label, note string, 
 		}
 		_ = accountSetStatus(existing.ID, "enabled")
 		markAccountResult(existing.ID, true, "")
-		bindAccountProxy(existing.ID, proxyID)
+		bindAccountProxy(existing.ID, validation.ProxyID)
 		invalidateGeminiUsageCache(existing.ID)
 		return existing.ID, nil
 	}
@@ -679,8 +874,36 @@ func adoptGoogleLogin(cookie string, targetAccountID int64, label, note string, 
 		return 0, err
 	}
 	markAccountResult(id, true, "")
-	bindAccountProxy(id, proxyID)
+	bindAccountProxy(id, validation.ProxyID)
 	return id, nil
+}
+
+func googleLoginProxyFallbackWarning(preferredProxyID, selectedProxyID int64) string {
+	selected := "direct connection"
+	if selectedProxyID > 0 {
+		selected = fmt.Sprintf("proxy #%d", selectedProxyID)
+	}
+	return fmt.Sprintf("preferred proxy #%d was unavailable; validation used %s", preferredProxyID, selected)
+}
+
+func googleLoginNetworkWarning() string {
+	if len(listProxies()) == 0 {
+		return ""
+	}
+	return "the browser signs in directly, while backend validation/API requests may use the configured proxy pool"
+}
+
+func combineGoogleLoginWarnings(first, second string) string {
+	first = strings.TrimSpace(first)
+	second = strings.TrimSpace(second)
+	switch {
+	case first == "":
+		return second
+	case second == "":
+		return first
+	default:
+		return first + "; " + second
+	}
 }
 
 func formatLoginNote(note string) string {
