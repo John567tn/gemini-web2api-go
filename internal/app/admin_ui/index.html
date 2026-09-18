@@ -635,40 +635,55 @@ const pages = {
   },
 
   cookies: async () => {
-    const data = await api('api/cookies');
+    const [data, usageData] = await Promise.all([
+      api('api/cookies'),
+      api('api/gemini-usage').catch(() => ({ items: [] })),
+    ]);
     const items = data.items || [];
+    const usageByID = Object.fromEntries((usageData.items || []).map(x => [x.account && x.account.id, x]));
     const deadN = items.filter(a => a.health === 'dead').length;
+    const usageCell = (u, key) => {
+      if (!u) return '<span class="badge muted">未读取</span>';
+      if (u.status === 'auth_session_expired') return '<span class="badge fail">Re-login</span>';
+      if (u.status !== 'ok' || !u.windows || !u.windows[key]) return '<span class="badge muted">不可用</span>';
+      const w = u.windows[key];
+      return `<div><b>${Number(w.used_percent).toFixed(1)}% used · ${Number(w.remaining_percent).toFixed(1)}% left</b></div>
+        <div class="muted" style="font-size:11px">reset ${escapeHtml(new Date(w.reset_at).toLocaleString('zh-CN', {hour12:false}))}</div>`;
+    };
     return `
       <div class="panel page-fill">
-        <h2>Cookie 池
+        <h2>Google 账号
           <span class="controls">
             ${deadN > 0 ? '<span class="badge fail" style="margin-right:8px" title="这些号鉴权在失败，多半 cookie 过期了，建议用 Firefox 重新导出">' + deadN + ' 疑似失效</span>' : ''}
             <span class="badge ${data.enabled > 0 ? 'ok' : 'muted'}" style="margin-right:8px">${data.enabled || 0} 启用 / ${data.total || 0} 共</span>
-            <button class="btn" onclick="addCookieAcct()">+ 导入 Cookie</button>
+            <button class="btn" onclick="startNativeGoogleLogin()">Sign in with Google</button>
           </span>
         </h2>
         <details class="note">
-          <summary>每行一个 Google 登录态账号</summary>
+          <summary>本地登录安全说明</summary>
           <div class="body">
-            粘贴 gemini.google.com 下的<b>完整 cookie 串</b>（至少含 SID / HSID / SSID /
-            APISID / SAPISID / __Secure-1PSID / __Secure-1PSIDTS）。请求时按<b>最久未用优先</b>自动轮转挑一个
-            启用的账号，媒体生成有每账号 10/天 的配额，配越多号总容量越大。<br><br>
-            凭证保存后<b>不再回传浏览器</b>，列表只显示脱敏摘要（cookie 数 / 关键项 /
-            SAPISID 末 4 位 / 失败次数）。缺 <code>__Secure-1PSIDTS</code> 的号会标黄，
-            首次保活会尝试向 Google 补发；若反复失败请用 <b>Firefox</b> 重新导出
-            （Chrome 新版本的设备绑定会话续不了）。
+            点击主按钮后会打开程序自己的 Chrome / Edge / Chromium 窗口，并使用独立的本地 profile。
+            你只在 Google 页面中完成登录；程序不会读取、代理或填写密码、2FA、Passkey，也不会把 Cookie
+            显示在普通面板中。登录成功后浏览器会自动关闭，之后由本地 Cookie pool 和 rotation 维持会话。
+          </div>
+        </details>
+        <details class="note" style="margin-bottom:12px">
+          <summary>Advanced / Legacy · Cookie Import</summary>
+          <div class="body">
+            仅为 backwards compatibility 保留。建议优先使用上面的本地 Google 登录流程。
+            <button class="btn muted" style="margin-top:10px" onclick="addCookieAcct()">+ Import Legacy Cookie</button>
           </div>
         </details>
         <div class="table-scroll">
           <table>
             <colgroup>
-              <col style="width:48px"><col style="width:160px"><col style="width:80px">
-              <col style="width:150px"><col style="width:92px"><col style="width:64px">
-              <col style="width:150px"><col><col style="width:150px">
+              <col style="width:48px"><col style="width:160px"><col style="width:110px">
+              <col style="width:210px"><col style="width:210px"><col style="width:150px">
+              <col><col style="width:250px">
             </colgroup>
             <thead><tr>
-              <th class="nw">ID</th><th class="nw">标签</th><th class="nw">状态</th>
-              <th class="nw">关键 Cookie</th><th class="nw">SAPISID</th><th class="nw">失败</th>
+              <th class="nw">ID</th><th class="nw">账号标签</th><th class="nw">会话状态</th>
+              <th class="nw">Gemini Apps · 5h</th><th class="nw">Gemini Apps · Weekly</th>
               <th class="nw">最近成功</th><th>最近错误</th><th class="nw">操作</th>
             </tr></thead>
             <tbody>${items.map(a => `
@@ -676,29 +691,25 @@ const pages = {
                 <td class="num nw">${a.id}</td>
                 <td class="truncate" title="${escapeHtml(a.label || '')}">${a.label ? escapeHtml(a.label) : '<span class="badge muted">未命名</span>'}</td>
                 <td class="nw">${
-                  a.health === 'dead' ? '<span class="badge fail" title="鉴权在失败，多半 cookie 过期了，建议用 Firefox 重新导出">疑似失效</span>'
+                  a.health === 'dead' ? '<span class="badge fail" title="Google session 失效，需要重新登录">Re-login</span>'
                   : a.health === 'disabled' ? '<span class="badge muted">禁用</span>'
-                  : a.health === 'unknown' ? '<span class="badge warn" title="还没成功用过，点「检测」确认">待检测</span>'
-                  : '<span class="badge ok">正常</span>'
+                  : a.health === 'unknown' ? '<span class="badge warn">待验证</span>'
+                  : '<span class="badge ok">已登录</span>'
                 }</td>
-                <td class="nw" title="共 ${a.cookie_count} 个 cookie，关键项：${(a.key_cookies||[]).join(' / ')}">
-                  <span class="badge ${a.has_1psidts ? 'ok' : 'warn'}">${(a.key_cookies||[]).length}/7 项</span>
-                  ${a.has_1psidts ? '' : '<span class="badge warn" title="缺 __Secure-1PSIDTS，首次保活会尝试补发；失败请用 Firefox 重新导出">缺 TS</span>'}
-                </td>
-                <td class="pre nw">${a.sapisid_tail ? '…' + escapeHtml(a.sapisid_tail) : '—'}</td>
-                <td class="num nw">${a.fail_count > 0 ? '<span class="badge fail">' + a.fail_count + '</span>' : 0}</td>
+                <td class="nw">${usageCell(usageByID[a.id], 'five_hour')}</td>
+                <td class="nw">${usageCell(usageByID[a.id], 'weekly')}</td>
                 <td class="nw" style="font-size:12px;color:var(--muted)">${a.last_ok_at ? fmt.ts(a.last_ok_at) : '—'}</td>
                 <td class="pre truncate" title="${escapeHtml(a.last_error || '')}">${escapeHtml(a.last_error || '—')}</td>
                 <td class="nw">
                   <span class="actions">
-                    <button class="btn muted" onclick="checkCookieAcct(${a.id}, this)">检测</button>
-                    <button class="btn muted" onclick="rotateCookieAcct(${a.id}, this)">保活</button>
+                    <button class="btn muted" onclick="refreshUsageAcct(${a.id}, this)">Refresh Usage</button>
+                    <button class="btn muted" onclick="reloginCookieAcct(${a.id})">Re-login</button>
                     <button class="btn muted" onclick="toggleCookieAcct(${a.id})">${a.status === 'enabled' ? '禁用' : '启用'}</button>
                     <button class="btn muted" onclick="editCookieAcct(${a.id}, ${JSON.stringify(a.label || '').replace(/"/g, '&quot;')}, ${JSON.stringify(a.note || '').replace(/"/g, '&quot;')})">编辑</button>
                     <button class="btn danger" onclick="delCookieAcct(${a.id})">删除</button>
                   </span>
                 </td>
-              </tr>`).join('') || '<tr><td colspan="9" class="empty">Cookie 池是空的。点「+ 导入 Cookie」加一个登录态账号。</td></tr>'}
+              </tr>`).join('') || '<tr><td colspan="8" class="empty">还没有 Google 账号。点击 Sign in with Google 开始。</td></tr>'}
             </tbody>
           </table>
         </div>
@@ -1162,6 +1173,100 @@ function joinCookieObj(obj) {
     .map(([k, v]) => `${k}=${String(v).trim()}`).join('; ');
 }
 
+async function startNativeGoogleLogin() {
+  const data = await modalForm({
+    title: 'Sign in with Google',
+    desc: '程序会打开一个独立的 Chrome / Edge / Chromium 窗口。请只在 Google 页面中完成登录；不要把密码、2FA 或 Passkey 输入到本面板。',
+    fields: [
+      { name: 'label', label: '账号标签', placeholder: '例如 AI Pro，可留空', hint: '只保存在本机账号表中，用于区分账号。' },
+      { name: 'note', label: '备注', placeholder: '可留空' },
+    ],
+    submitText: '打开 Google 登录',
+  });
+  if (!data) return;
+  await beginNativeGoogleLogin({ label: data.label, note: data.note, account_id: 0 });
+}
+
+async function beginNativeGoogleLogin(payload) {
+  const r = await fetch('api/google-login/start', {
+    method: 'POST', credentials: 'include',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) {
+    flash('Google 登录无法启动：' + (j.error || r.status));
+    return;
+  }
+  showGoogleLoginProgress(j.session);
+}
+
+function showGoogleLoginProgress(session) {
+  const overlay = document.createElement('div');
+  overlay.className = 'modal-overlay';
+  overlay.innerHTML = `
+    <div class="modal" role="dialog" aria-modal="true">
+      <h3>Sign in with Google</h3>
+      <div class="desc">请在刚打开的受控浏览器中完成登录。此面板不会接触密码、2FA 或 Passkey。</div>
+      <div class="modal-body">
+        <div id="googleLoginState" class="hint">正在等待浏览器…</div>
+        <div class="track" style="margin-top:16px"><div id="googleLoginProgress" class="fill" style="width:12%"></div></div>
+      </div>
+      <div class="actions"><button class="btn danger" data-act="cancel">取消登录</button></div>
+    </div>`;
+  document.body.appendChild(overlay);
+  const stateEl = overlay.querySelector('#googleLoginState');
+  const progressEl = overlay.querySelector('#googleLoginProgress');
+  const cancelBtn = overlay.querySelector('[data-act=cancel]');
+  let timer = null;
+  let stopped = false;
+  const finish = (message, ok) => {
+    stopped = true;
+    if (timer) clearTimeout(timer);
+    stateEl.textContent = message;
+    progressEl.style.width = ok ? '100%' : '0%';
+    cancelBtn.disabled = true;
+    setTimeout(() => { overlay.remove(); if (ok) refreshPage(); }, ok ? 900 : 1400);
+  };
+  const poll = async () => {
+    if (stopped) return;
+    const r = await fetch('api/google-login/' + encodeURIComponent(session) + '/status', { credentials: 'include' });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) { finish(j.error || '登录 session 已结束', false); return; }
+    stateEl.textContent = j.message || j.state || '处理中…';
+    if (j.state === 'succeeded') { finish('Google 登录成功，账号已加入本地账号池。', true); return; }
+    if (['failed', 'canceled', 'expired'].includes(j.state)) { finish(j.message || '登录未完成', false); return; }
+    progressEl.style.width = j.state === 'validating' ? '78%' : (j.state === 'waiting_for_login' ? '42%' : '18%');
+    timer = setTimeout(poll, 1200);
+  };
+  cancelBtn.onclick = async () => {
+    if (stopped) return;
+    cancelBtn.disabled = true;
+    await fetch('api/google-login/' + encodeURIComponent(session) + '/cancel', { method: 'POST', credentials: 'include' }).catch(() => {});
+    finish('登录已取消。', false);
+  };
+  poll();
+}
+
+async function reloginCookieAcct(id) {
+  const r = await fetch('api/cookies/' + id + '/relogin', { method: 'POST', credentials: 'include' });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) { flash('Re-login 无法启动：' + (j.error || r.status)); return; }
+  showGoogleLoginProgress(j.session);
+}
+
+async function refreshUsageAcct(id, btn) {
+  const old = btn.textContent;
+  btn.textContent = '…'; btn.disabled = true;
+  try {
+    const r = await fetch('api/gemini-usage?account_id=' + encodeURIComponent(id) + '&refresh=1', { credentials: 'include' });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) { flash('Usage 刷新失败：' + ((j.error && j.error.message) || j.error || r.status)); return; }
+    flash('Gemini Apps usage 已刷新');
+    await refreshPage();
+  } finally { btn.textContent = old; btn.disabled = false; }
+}
+
 async function addCookieAcct() {
   // 两个模式共用这一份状态，切 tab 时互相带过去。extras 存的是不在
   // COOKIE_KEYS 里的项——整串粘贴进来的 cookie 往往还带一堆别的，
@@ -1169,9 +1274,9 @@ async function addCookieAcct() {
   let extras = {};
 
   const data = await buildModal({
-    title: '导入 Cookie',
+    title: 'Legacy Cookie Import',
     wide: true,
-    desc: '浏览器 F12 → Application → Cookies → 选 <code>https://gemini.google.com</code>。逐项抄或整串粘贴都行，两种填法可随时切换，已填的内容会带过去。',
+    desc: 'Advanced compatibility path only. Browser F12 → Application → Cookies → <code>https://gemini.google.com</code>。优先使用 Sign in with Google。',
     bodyHTML: `
       <div class="field">
         <label>标签</label>
@@ -1667,11 +1772,11 @@ const NAV = [
   ['dashboard', '概览'],
   ['requests', '请求记录'],
   ['proxies', '代理池'],
-  ['cookies', 'Cookie 池'],
+  ['cookies', 'Google 账号'],
   ['settings', '设置'],
 ];
 const PAGE_TITLES = {
-  dashboard: '概览', requests: '请求记录', proxies: '代理池', cookies: 'Cookie 池', settings: '设置',
+  dashboard: '概览', requests: '请求记录', proxies: '代理池', cookies: 'Google 账号', settings: '设置',
 };
 
 function toggleSidebar() {
@@ -1781,6 +1886,7 @@ const I18N_EN = {
   '请求记录': 'Requests',
   '代理池': 'Proxy Pool',
   'Cookie 池': 'Cookie Pool',
+  'Google 账号': 'Google Accounts',
   '设置': 'Settings',
   '运行中': 'Running',
   '无法连接': 'Disconnected',

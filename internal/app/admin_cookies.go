@@ -99,7 +99,7 @@ func handleAdminCookies(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, 400, map[string]string{"error": err.Error()})
 			return
 		}
-		logf("[cookies] 新增账号 #%d label=%q", id, strings.TrimSpace(p.Label))
+		logf("[cookies] 新增账号 #%d", id)
 		writeJSON(w, 200, map[string]interface{}{"id": id})
 	default:
 		writeJSON(w, 405, map[string]string{"error": "method not allowed"})
@@ -137,6 +137,23 @@ func handleAdminCookieItem(w http.ResponseWriter, r *http.Request) {
 		logf("[cookies] 删除账号 #%d", id)
 		writeJSON(w, 200, map[string]bool{"ok": true})
 	case http.MethodPost:
+		if action == "relogin" {
+			if !isLocalAdminRequest(r) {
+				writeJSON(w, 403, map[string]string{"error": "native Google login is localhost-only on the server host"})
+				return
+			}
+			if accountByID(id) == nil {
+				writeJSON(w, 404, map[string]string{"error": "account not found"})
+				return
+			}
+			s, startErr := googleLogins.start("", "", id)
+			if startErr != nil {
+				writeJSON(w, 400, map[string]string{"error": startErr.Error()})
+				return
+			}
+			writeJSON(w, 202, s.view())
+			return
+		}
 		if action == "rotate" {
 			for _, a := range accountList() {
 				if a.ID == id {

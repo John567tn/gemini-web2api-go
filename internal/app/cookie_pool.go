@@ -111,13 +111,12 @@ func accountAdd(label, cookie, note string) (int64, error) {
 // 不该在升级时被我们新加的校验拦下来，让用户悄无声息地退回匿名。只警告，
 // 健康度会在面板上如实体现。
 func accountAdopt(label, cookie, note string) (int64, error) {
-	cookie, ok := normalizeCookie(cookie, label)
+	cookie, ok := normalizeCookie(cookie, "account import")
 	if !ok {
 		return 0, fmt.Errorf("cookie 解析失败")
 	}
 	if extractSAPISID(cookie) == "" {
-		logf("[cookie] %s 里没有 SAPISID，算不出 SAPISIDHASH 授权头，可能只当匿名处理；"+
-			"先按原样导入，请到面板核对", label)
+		logf("[cookie] imported account has no SAPISID; it may be treated as anonymous")
 	}
 	return accountInsert(label, cookie, note)
 }
@@ -170,9 +169,42 @@ func accountByID(id int64) *CookieAccount {
 	return &a
 }
 
+func accountByCookie(cookie string) *CookieAccount {
+	for _, a := range accountList() {
+		if a.Cookie == cookie {
+			copy := a
+			return &copy
+		}
+	}
+	return nil
+}
+
+// accountReplaceCookie is used only by an explicit native re-login.  Unlike
+// updateAccountCookie (which guards background Set-Cookie refreshes against an
+// unexpected account identity change), this is an intentional replacement of
+// the account's Google session while preserving its local account id/label.
+func accountReplaceCookie(id int64, cookie, label string) error {
+	if id <= 0 || strings.TrimSpace(cookie) == "" {
+		return fmt.Errorf("account replacement is invalid")
+	}
+	if label == "" {
+		_, err := getDB().Exec(
+			`UPDATE accounts SET cookie=?, status='enabled', fail_count=0, last_error='', last_ok_at=? WHERE id=?`,
+			cookie, time.Now().Unix(), id)
+		return err
+	}
+	_, err := getDB().Exec(
+		`UPDATE accounts SET cookie=?, label=?, status='enabled', fail_count=0, last_error='', last_ok_at=? WHERE id=?`,
+		cookie, strings.TrimSpace(label), time.Now().Unix(), id)
+	return err
+}
+
 // accountDelete 删除一条。
 func accountDelete(id int64) error {
 	_, err := getDB().Exec(`DELETE FROM accounts WHERE id=?`, id)
+	if err == nil {
+		invalidateGeminiUsageCache(id)
+	}
 	return err
 }
 

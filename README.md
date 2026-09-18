@@ -45,6 +45,7 @@
 - 每个出口 IP 独立限流：并发 / RPM / RPH 三档
 - 代理池：运行时增删改、失败熔断、轮转调度，每个代理是独立限流槽
 - Cookie 池：多个 Google 账号按最久未用优先轮转，自动续期 + 保活，每个账号粘住自己的出口
+- Admin 面板支持本地受控 Chrome / Edge / Chromium 的 `Sign in with Google` 登录，另可读取 Gemini Apps consumer 的 5 小时 / Weekly compute usage
 
 **运维**
 - 单二进制，交叉编译 6 平台；容器镜像基于 distroless
@@ -219,8 +220,47 @@ Claude Code / Cursor 这类 MCP 客户端能「用 Gemini 去搜网」，返回*
 - **概览** — 24h KPI + 请求量/P50 延迟双轴趋势图 + 模型/代理分组统计 + IP 限流用量 + 一键连通性诊断
 - **请求记录** — 明细列表（仅元数据，无 prompt/response 内容），状态/模型筛选 + 分页
 - **代理池** — 运行时增删改 + 启用/禁用 + 失败次数熔断（每代理是独立 IP slot）
-- **Cookie 池** — 导入多个 Google 登录态账号，请求按**最久未用优先**自动轮转。每个账号一键「检测」是否仍是登录态，**失效的账号标红提示重导**；自动换发 `__Secure-1PSIDTS` + 每 10 分钟保活；每个账号粘住自己的出口。列表只显示脱敏摘要（cookie 数 / 关键项 / SAPISID 末 4 位 / 失败次数）
+- **Google 账号** — 主入口是本地 `Sign in with Google`；请求按**最久未用优先**自动轮转。每个账号显示 session health、Gemini Apps 5h / Weekly usage 与 reset time，失效账号提供 `Re-login`；自动换发 `__Secure-1PSIDTS` + 每 10 分钟保活；每个账号粘住自己的出口。Legacy Cookie Import 仍在 Advanced 区域保留。
 - **设置** — 运行时配置表单（保存即生效）+ API Key 轮换 + 部署期配置只读展示
+
+### 本地 Google 登录与 Gemini Apps usage
+
+Cookie Pool 页面现在的主入口是 **Sign in with Google**。服务会启动一个只绑定
+`127.0.0.1` DevTools 的独立浏览器 profile，导航到 `https://gemini.google.com/app`；
+登录、密码、2FA 和 Passkey 全部由用户直接在 Google 页面完成。服务只在本机读取该受控实例
+的 Google session cookies，并在 `/app` 页面取得有效 `SNlM0e` 后才写入现有 `accounts` 表。
+登录浏览器成功后自动关闭，普通请求继续使用原有 Cookie rotation / proxy affinity。找不到
+Chrome、Edge 或 Chromium 时会返回明确错误。若服务监听 `0.0.0.0`，native login 的
+start/status/cancel/re-login 请求仍只接受本机 loopback 请求。
+
+Legacy Cookie Import 仍保留在 `Advanced / Legacy` 区域。账号失效显示为 `Re-login`，
+不会被误报为 quota exhausted。
+
+机器接口（使用 OpenAI API key）：
+
+```bash
+curl -H "Authorization: Bearer $API_KEY" \
+  http://localhost:8083/v1/gemini/usage
+
+# 多账号时按账号查询
+curl -H "Authorization: Bearer $API_KEY" \
+  'http://localhost:8083/v1/gemini/usage?account_id=1'
+```
+
+返回对象的 `source` 固定为 `gemini_apps_web`，表示 Gemini Apps consumer 网页额度，
+不是 Gemini CLI / Code Assist / Antigravity quota。结果按 account ID 缓存约 30 秒；账号
+session 失效时返回 `auth_session_expired` 和 `Re-login` 语义，不会把未知状态伪装成
+`remaining_percent: 0`。管理面板对应接口是 `GET /admin/api/gemini-usage`，并支持
+`?account_id=1&refresh=1`。
+
+Native login 的 admin-only 状态接口为：
+
+```text
+POST /admin/api/google-login/start
+GET  /admin/api/google-login/{session}/status
+POST /admin/api/google-login/{session}/cancel
+POST /admin/api/cookies/{accountID}/relogin
+```
 
 面板前端是单个 HTML，Chart.js 随二进制 embed，**不走 CDN**——内网/离线部署也能开。
 
@@ -367,7 +407,7 @@ curl http://127.0.0.1:8083/v1/chat/completions \
 | 项 | 说明 |
 |---|---|
 | API Key | 首次启动自动生成，面板里可轮换或自定义 |
-| Google Cookie | 面板「设置」页直接粘贴，保存即生效。挂上之后 `gemini-3.1-pro` 才会出现在模型列表里 |
+| Google session | 面板「Google 账号」页使用 `Sign in with Google`；Legacy Cookie Import 仅在 Advanced 区域保留。挂上之后 `gemini-3.1-pro` 才会出现在模型列表里 |
 
 两者都存在数据库里。已保存的值不回显（cookie 只显示识别到几个、关键项齐不齐）。
 
@@ -411,6 +451,9 @@ Cookie 池（按 URL、cookie 内容去重），之后一律从面板管理。�
 ## Cookie（可选）
 
 挂 Google 账号 cookie 后请求走登录态，多出来的能力是 **`gemini-3.1-pro` + 思考链**
+
+推荐在管理面板「Google 账号」页点击 **Sign in with Google**，由本机受控浏览器完成登录。
+下面的 DevTools 导入仅作为 Advanced / Legacy backwards-compatible 入口保留：
 （见上文「思考链」一节）、**读图 / 读视频**、**生图（`gemini-image`）/ 音乐（`gemini-music`）
 / 画布（`gemini-canvas`）/ 生视频（`gemini-video`，要 Pro 号）**。免费账号实测可用，
 连打 6 次全部回报 `3.1 Pro`。
@@ -572,6 +615,8 @@ internal/app/              全部实现
   client.go                tls-client (chrome146) + stdlib (走代理) 双 client
   gemini.go                模型表 + 80 槽 payload + 模型 header + StreamGenerate + wrb.fr 解析
   xsrf.go                  带 cookie 时必需的 XSRF token：抓取 + 按 cookie 缓存 + 过期自愈
+  google_login.go          本地受控浏览器登录状态机、CDP cookie 提取与 loopback 安全边界
+  gemini_usage.go          Gemini Apps jSf9Qc usage RPC、双 schema parser 与 30 秒缓存
   messages.go              OpenAI messages → prompt，tool_call 解析
   server.go                /v1/* + 限流入口 + 参数校验 + metrics 写入
   sse.go                   SSE 写出器（懒发 header，失败仍能返回 502 JSON）

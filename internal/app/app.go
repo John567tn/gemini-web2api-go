@@ -114,6 +114,7 @@ func Run() {
 			writeJSON(w, 405, map[string]string{"error": "method not allowed"})
 		}
 	}))
+	mux.HandleFunc("/v1/gemini/usage", requireAPIKey(handleGeminiUsage))
 	// /v1/videos —— OpenAI(Sora) 形状的异步视频生成。POST 建任务，GET 轮询，GET .../content 下 MP4。
 	mux.HandleFunc("/v1/videos", requireAPIKey(handleCreateVideo))
 	mux.HandleFunc("/v1/videos/", requireAPIKey(handleVideoItem))
@@ -144,6 +145,9 @@ func Run() {
 		mux.HandleFunc("/admin/api/config", requireAuth(handleAdminConfig))
 		mux.HandleFunc("/admin/api/cookies", requireAuth(handleAdminCookies))
 		mux.HandleFunc("/admin/api/cookies/", requireAuth(handleAdminCookieItem))
+		mux.HandleFunc("/admin/api/google-login/start", requireAuth(handleGoogleLoginStart))
+		mux.HandleFunc("/admin/api/google-login/", requireAuth(handleGoogleLoginSession))
+		mux.HandleFunc("/admin/api/gemini-usage", requireAuth(handleAdminGeminiUsage))
 		mux.HandleFunc("/admin/api/test", requireAuth(handleAdminTest))
 	}
 
