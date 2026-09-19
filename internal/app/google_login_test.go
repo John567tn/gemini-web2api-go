@@ -256,17 +256,68 @@ func TestNativeLoginStateMachineBrowserClosesBeforeLogin(t *testing.T) {
 	waitForProfileGone(t, s.profileDir)
 }
 
+func TestNativeLoginPagePreparationFailureLocksCandidate(t *testing.T) {
+	withFastGoogleLoginTimers(t)
+	fake := newFakeLoginBrowser()
+	fake.navigateErr = errors.New("page target unavailable")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var launches atomic.Int32
+	manager := newGoogleLoginManager(
+		func(context.Context, string, string) (googleLoginBrowser, error) {
+			launches.Add(1)
+			return fake, nil
+		},
+		func(googleSessionValidationRequest) (googleSessionValidation, error) {
+			return googleSessionValidation{}, errors.New("keep waiting")
+		},
+	)
+	profileDir := filepath.Join(t.TempDir(), "profile")
+	if err := prepareGoogleBrowserProfile(profileDir); err != nil {
+		t.Fatal(err)
+	}
+	s := &googleLoginSession{manager: manager, id: "page-prepare-failure", state: googleLoginLaunching, profileDir: profileDir, startedAt: time.Now(), expiresAt: time.Now().Add(time.Minute), cancel: cancel}
+	manager.sessions[s.id] = s
+	go s.run(ctx, []browserCandidate{{name: "Chrome", executable: "chrome"}, {name: "Edge", executable: "edge"}})
+	waitForGoogleLoginState(t, s, googleLoginWaiting)
+	if launches.Load() != 1 || s.browserName != "Chrome" || !strings.Contains(s.view()["warning"].(string), "login_page_prepare_failed") {
+		t.Fatalf("page preparation incorrectly triggered fallback: launches=%d browser=%s view=%+v", launches.Load(), s.browserName, s.view())
+	}
+	s.cancelSession()
+	waitForProfileGone(t, s.profileDir)
+}
+
+func TestNativeLoginBrowserLevelCookiePollingSurvivesPageLoss(t *testing.T) {
+	withFastGoogleLoginTimers(t)
+	fake := newFakeLoginBrowser()
+	fake.pageGone.Store(true)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	s := startMockGoogleLogin(t, ctx, cancel, fake, 0, func(googleSessionValidationRequest) (googleSessionValidation, error) {
+		return googleSessionValidation{}, nil
+	})
+	waitForGoogleLoginState(t, s, googleLoginSucceeded)
+	if s.accountID > 0 {
+		_ = accountDelete(s.accountID)
+	}
+}
+
 func TestNativeLoginBrowserCandidateFallbackBeforeInteractiveLogin(t *testing.T) {
 	withFastGoogleLoginTimers(t)
 	fake := newFakeLoginBrowser()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	var launches atomic.Int32
+	var firstProfile string
+	var firstProfileGone atomic.Bool
 	manager := newGoogleLoginManager(
-		func(context.Context, string, string) (googleLoginBrowser, error) {
+		func(_ context.Context, _ string, profileDir string) (googleLoginBrowser, error) {
 			if launches.Add(1) == 1 {
+				firstProfile = profileDir
 				return nil, errors.New("CDP readiness timeout")
 			}
+			_, statErr := os.Stat(firstProfile)
+			firstProfileGone.Store(os.IsNotExist(statErr))
 			return fake, nil
 		},
 		func(googleSessionValidationRequest) (googleSessionValidation, error) {
@@ -292,8 +343,8 @@ func TestNativeLoginBrowserCandidateFallbackBeforeInteractiveLogin(t *testing.T)
 		{name: "Edge", executable: "edge"},
 	})
 	waitForGoogleLoginState(t, s, googleLoginSucceeded)
-	if launches.Load() != 2 || fake.closeCount.Load() != 1 {
-		t.Fatalf("browser fallback did not happen cleanly: launches=%d closes=%d view=%+v", launches.Load(), fake.closeCount.Load(), s.view())
+	if launches.Load() != 2 || fake.closeCount.Load() != 1 || !firstProfileGone.Load() {
+		t.Fatalf("browser fallback did not happen cleanly: launches=%d closes=%d firstProfileGone=%v view=%+v", launches.Load(), fake.closeCount.Load(), firstProfileGone.Load(), s.view())
 	}
 	if attempts, ok := s.view()["attempts"].([]googleLoginAttempt); !ok || len(attempts) != 1 || attempts[0].Browser != "Chrome" || attempts[0].Failure != "cdp_readiness_timeout" {
 		t.Fatalf("browser fallback diagnostics missing: %+v", s.view())

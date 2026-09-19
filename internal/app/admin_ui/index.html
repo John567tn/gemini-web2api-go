@@ -1234,7 +1234,7 @@ function showGoogleLoginProgress(session) {
     const j = await r.json().catch(() => ({}));
     if (!r.ok) { finish(j.error || '登录 session 已结束', false); return; }
     const attempts = (j.attempts || []).map(a => `${a.browser}: ${a.failure}`).join(' · ');
-    stateEl.textContent = [j.message || j.state || '处理中…', j.failure ? `failure=${j.failure}` : '', attempts ? `attempts=${attempts}` : '']
+    stateEl.textContent = [j.message || j.state || '处理中…', j.stage ? `stage=${j.stage}` : '', j.failure ? `failure=${j.failure}` : '', attempts ? `attempts=${attempts}` : '']
       .filter(Boolean).join(' · ');
     if (j.state === 'succeeded') { finish('Google 登录成功，账号已加入本地账号池。', true); return; }
     if (['failed', 'canceled', 'expired'].includes(j.state)) { finish(j.message || '登录未完成', false); return; }

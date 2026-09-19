@@ -359,12 +359,19 @@ type fakeGoogleLoginBrowser struct {
 	cookies     []browserCookie
 	navigateErr error
 	cookieErr   error
+	pageGone    atomic.Bool
 	closed      atomic.Bool
 	closeCount  atomic.Int32
 	closeOnce   sync.Once
 }
 
-func (b *fakeGoogleLoginBrowser) Navigate(context.Context, string) error { return b.navigateErr }
+func (b *fakeGoogleLoginBrowser) EnsureBrowserConnected(context.Context) error { return b.navigateErr }
+func (b *fakeGoogleLoginBrowser) PrepareLoginPage(context.Context, string) error {
+	if b.pageGone.Load() {
+		return errors.New("page target disappeared")
+	}
+	return b.navigateErr
+}
 func (b *fakeGoogleLoginBrowser) Cookies(context.Context) ([]browserCookie, error) {
 	if b.cookieErr != nil {
 		return nil, b.cookieErr

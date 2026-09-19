@@ -19,7 +19,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/chromedp/cdproto/network"
+	"github.com/chromedp/cdproto/cdp"
+	"github.com/chromedp/cdproto/storage"
 	"github.com/chromedp/cdproto/target"
 	"github.com/chromedp/chromedp"
 	"github.com/google/uuid"
@@ -68,7 +69,8 @@ type browserCookie struct {
 }
 
 type googleLoginBrowser interface {
-	Navigate(context.Context, string) error
+	EnsureBrowserConnected(context.Context) error
+	PrepareLoginPage(context.Context, string) error
 	Cookies(context.Context) ([]browserCookie, error)
 	Close() error
 }
@@ -228,14 +230,19 @@ func (s *googleLoginSession) run(ctx context.Context, candidates []browserCandid
 			s.recordAttempt(candidate.name, "browser_process_exit")
 			continue
 		}
+		candidateProfileDir := filepath.Join(s.profileDir, strings.ToLower(candidate.name))
+		if err := prepareGoogleBrowserProfile(candidateProfileDir); err != nil {
+			s.recordAttempt(candidate.name, "browser_process_exit")
+			continue
+		}
 		s.setBrowserCandidate(candidate.name)
 		s.setStage(googleLoginStageBrowserStarted, "正在启动受控浏览器")
 		s.setStage(googleLoginStageWaitingCDP, "正在等待本地 CDP 就绪")
-		candidateBrowser, err := s.manager.factory(ctx, candidate.executable, s.profileDir)
+		candidateBrowser, err := s.manager.factory(ctx, candidate.executable, candidateProfileDir)
 		if err != nil {
 			s.recordAttempt(candidate.name, classifyNativeBrowserFailure(err))
-			if cleanupErr := removeGoogleBrowserProfile(s.profileDir); cleanupErr != nil {
-				scheduleGoogleBrowserProfileCleanup(s.profileDir)
+			if cleanupErr := removeGoogleBrowserProfile(candidateProfileDir); cleanupErr != nil {
+				scheduleGoogleBrowserProfileCleanup(candidateProfileDir)
 			}
 			continue
 		}
@@ -244,22 +251,15 @@ func (s *googleLoginSession) run(ctx context.Context, candidates []browserCandid
 		s.browser = browser
 		s.mu.Unlock()
 		s.setStage(googleLoginStageCDPReady, "本地 CDP 已就绪")
-		s.setStage(googleLoginStageAttaching, "正在连接浏览器页面")
-		s.setStage(googleLoginStageOpeningGemini, "正在打开 Gemini 登录页")
-		if err := browser.Navigate(ctx, googleLoginURL); err != nil {
-			failure := classifyNativeBrowserFailure(err)
-			s.recordAttempt(candidate.name, failure)
-			_ = browser.Close()
-			browser = nil
-			s.mu.Lock()
-			s.browser = nil
-			s.mu.Unlock()
-			if cleanupErr := removeGoogleBrowserProfile(s.profileDir); cleanupErr != nil {
-				scheduleGoogleBrowserProfileCleanup(s.profileDir)
-			}
-			continue
+		s.setStage(googleLoginStageAttaching, "浏览器 CDP 已连接")
+		s.setStage(googleLoginStageOpeningGemini, "正在准备 Gemini 登录页")
+		prepareErr := browser.PrepareLoginPage(ctx, googleLoginURL)
+		if prepareErr != nil {
+			s.addWarning(candidate.name + "：login_page_prepare_failed；如果 Gemini 页面未自动打开，请在此浏览器窗口手动进入 gemini.google.com")
+			s.setStage(googleLoginStageWaiting, "Chrome 已连接；如果 Gemini 页面未自动打开，请在此浏览器窗口手动进入 gemini.google.com")
+		} else {
+			s.setStage(googleLoginStageWaiting, "请在浏览器窗口中直接完成 Google 登录；程序不会读取或填写密码、2FA、Passkey")
 		}
-		s.setStage(googleLoginStageWaiting, "请在浏览器窗口中直接完成 Google 登录；程序不会读取或填写密码、2FA、Passkey")
 		break
 	}
 	if browser == nil {
@@ -369,6 +369,12 @@ func (s *googleLoginSession) recordAttempt(browser, failure string) {
 	s.attempts = append(s.attempts, googleLoginAttempt{Browser: browser, Failure: failure})
 	s.mu.Unlock()
 	logf("[google-login] browser candidate %s failed: %s", browser, failure)
+}
+
+func (s *googleLoginSession) addWarning(warning string) {
+	s.mu.Lock()
+	s.warning = combineGoogleLoginWarnings(s.warning, warning)
+	s.mu.Unlock()
 }
 
 func (s *googleLoginSession) lastAttemptFailure() string {
@@ -882,6 +888,7 @@ func discoverGoogleBrowsers() ([]browserCandidate, error) {
 
 type chromedpGoogleBrowser struct {
 	ctx           context.Context
+	browserCtx    context.Context
 	browserCancel context.CancelFunc
 	allocCancel   context.CancelFunc
 	targetCancel  context.CancelFunc
@@ -915,12 +922,18 @@ func launchChromedpBrowser(parent context.Context, executable, profileDir string
 	}
 	remoteCtx, allocCancel := chromedp.NewRemoteAllocator(parent, wsURL, chromedp.NoModifyURL)
 	browserCtx, browserCancel := chromedp.NewContext(remoteCtx)
-	return &chromedpGoogleBrowser{
+	browser := &chromedpGoogleBrowser{
 		ctx:           browserCtx,
+		browserCtx:    browserCtx,
 		browserCancel: browserCancel,
 		allocCancel:   allocCancel,
 		process:       cmd,
-	}, nil
+	}
+	if err := browser.EnsureBrowserConnected(parent); err != nil {
+		_ = browser.Close()
+		return nil, fmt.Errorf("cdp_attach_failed: %w", err)
+	}
+	return browser, nil
 }
 
 const (
@@ -1056,21 +1069,23 @@ func googleBrowserCommandArgs(profileDir string, port int) []string {
 	}
 }
 
-func (b *chromedpGoogleBrowser) Navigate(ctx context.Context, target string) error {
-	if err := b.selectNormalPageTarget(target); err != nil {
+func (b *chromedpGoogleBrowser) EnsureBrowserConnected(ctx context.Context) error {
+	_, err := chromedp.Targets(b.browserCtx)
+	return err
+}
+
+func (b *chromedpGoogleBrowser) PrepareLoginPage(ctx context.Context, geminiURL string) error {
+	if err := b.selectNormalPageTarget(geminiURL); err != nil {
 		return fmt.Errorf("no_normal_page_target: %w", err)
 	}
 	var current string
 	if err := chromedp.Run(b.ctx, chromedp.Location(&current)); err != nil {
-		return fmt.Errorf("cdp_attach_failed: %w", err)
+		return fmt.Errorf("page target unavailable: %w", err)
 	}
-	if isGeminiAppURL(current) {
-		if err := chromedp.Run(b.ctx, chromedp.WaitReady("body", chromedp.ByQuery)); err != nil {
-			return fmt.Errorf("gemini navigation failed: %w", err)
-		}
+	if isGeminiAppURL(current) || isGoogleSigninURL(current) {
 		return nil
 	}
-	if err := chromedp.Run(b.ctx, chromedp.Navigate(target), chromedp.WaitReady("body", chromedp.ByQuery)); err != nil {
+	if err := chromedp.Run(b.ctx, chromedp.Navigate(geminiURL), chromedp.WaitReady("body", chromedp.ByQuery)); err != nil {
 		return fmt.Errorf("gemini navigation failed: %w", err)
 	}
 	return nil
@@ -1080,7 +1095,7 @@ func (b *chromedpGoogleBrowser) selectNormalPageTarget(geminiURL string) error {
 	if b.targetCancel != nil {
 		return nil
 	}
-	targets, err := chromedp.Targets(b.ctx)
+	targets, err := chromedp.Targets(b.browserCtx)
 	if err != nil {
 		return fmt.Errorf("cdp attach: %w", err)
 	}
@@ -1090,7 +1105,7 @@ func (b *chromedpGoogleBrowser) selectNormalPageTarget(geminiURL string) error {
 			continue
 		}
 		if strings.HasPrefix(strings.ToLower(info.URL), "chrome://profile-picker") {
-			_ = target.CloseTarget(info.TargetID).Do(b.ctx)
+			_ = target.CloseTarget(info.TargetID).Do(b.browserCtx)
 			continue
 		}
 		if isGeminiAppURL(info.URL) {
@@ -1106,13 +1121,13 @@ func (b *chromedpGoogleBrowser) selectNormalPageTarget(geminiURL string) error {
 		selected = normal
 	}
 	if selected == nil {
-		id, createErr := target.CreateTarget(geminiURL).Do(b.ctx)
+		id, createErr := target.CreateTarget(geminiURL).Do(b.browserCtx)
 		if createErr != nil {
 			return fmt.Errorf("create normal page: %w", createErr)
 		}
 		selected = &target.Info{TargetID: id, Type: "page", URL: geminiURL}
 	}
-	pageCtx, cancel := chromedp.NewContext(b.ctx, chromedp.WithTargetID(selected.TargetID))
+	pageCtx, cancel := chromedp.NewContext(b.browserCtx, chromedp.WithTargetID(selected.TargetID))
 	b.ctx = pageCtx
 	b.targetCancel = cancel
 	return nil
@@ -1122,8 +1137,17 @@ func isGeminiAppURL(raw string) bool {
 	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(raw)), strings.ToLower(googleLoginURL))
 }
 
+func isGoogleSigninURL(raw string) bool {
+	lower := strings.ToLower(strings.TrimSpace(raw))
+	return strings.HasPrefix(lower, "https://accounts.google.com/") || strings.HasPrefix(lower, "https://signin.google.com/")
+}
+
 func (b *chromedpGoogleBrowser) Cookies(ctx context.Context) ([]browserCookie, error) {
-	cookies, err := network.GetCookies().WithURLs([]string{googleLoginURL}).Do(b.ctx)
+	c := chromedp.FromContext(b.browserCtx)
+	if c == nil || c.Browser == nil {
+		return nil, errors.New("browser CDP connection unavailable")
+	}
+	cookies, err := storage.GetCookies().Do(cdp.WithExecutor(b.browserCtx, c.Browser))
 	if err != nil {
 		return nil, err
 	}
