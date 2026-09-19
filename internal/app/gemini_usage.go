@@ -110,10 +110,13 @@ func extractGeminiUsagePageTokens(body []byte) (geminiUsagePageTokens, error) {
 }
 
 var (
-	geminiUsageCacheMu sync.Mutex
-	geminiUsageCache   = map[int64]usageCacheEntry{}
-	geminiUsageLocks   sync.Map // map[int64]*sync.Mutex
-	geminiUsageFetcher = fetchGeminiUsageLive
+	geminiUsageCacheMu      sync.Mutex
+	geminiUsageCache        = map[int64]usageCacheEntry{}
+	geminiUsageLocks        sync.Map // map[int64]*sync.Mutex
+	geminiUsageFetcher      = fetchGeminiUsageLive
+	metadataRouteSelector   = acquireMetadataRoute
+	geminiUsagePageFetcher  = fetchAppPage
+	geminiUsageRPCRequester = doGeminiRequest
 )
 
 type usageCacheEntry struct {
@@ -162,14 +165,13 @@ func fetchGeminiUsageLive(a CookieAccount) (*geminiUsageSnapshot, error) {
 	// but it must never call markCookieByStatus/markAccountResult: a quota probe
 	// is not a model request and must not reorder, disable, or heal the routing
 	// account pool.
-	picked, ok, err := acquireSlot(a.ProxyID)
-	if !ok {
+	route, err := metadataRouteSelector(a.ProxyID)
+	if err != nil {
 		return nil, err
 	}
-	defer releaseSlot(picked.ID)
-	proxyURL := picked.URL
+	proxyURL := route.Proxy.URL
 
-	page, err := fetchAppPage(a.Cookie, proxyURL)
+	page, err := geminiUsagePageFetcher(a.Cookie, proxyURL)
 	if err != nil {
 		if isGeminiUsageAuthFailure(err) {
 			return nil, newGeminiUsageAuthError(err)
@@ -203,7 +205,7 @@ func fetchGeminiUsageLive(a CookieAccount) (*geminiUsageSnapshot, error) {
 	headers := buildGeminiHeaders(a.Cookie, extractSAPISID(a.Cookie), "")
 	headers["Referer"] = geminiUsagePage
 
-	status, raw, _, setCookie, err := doGeminiRequest(endpoint, form.Encode(), headers, proxyURL, nil)
+	status, raw, _, setCookie, err := geminiUsageRPCRequester(endpoint, form.Encode(), headers, proxyURL, nil)
 	if len(setCookie) > 0 {
 		merged := mergeSetCookie(a.Cookie, setCookie)
 		if merged != a.Cookie {

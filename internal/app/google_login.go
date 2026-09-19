@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -477,11 +478,16 @@ func isLocalAdminRequest(r *http.Request) bool {
 	if !isLoopbackRemoteAddr(remote) {
 		return false
 	}
-	if !isLocalBrowserHost(r.Host) {
+	for _, header := range []string{"Forwarded", "X-Forwarded-For", "X-Forwarded-Host", "X-Forwarded-Proto", "X-Real-IP"} {
+		if values, present := r.Header[http.CanonicalHeaderKey(header)]; present && len(values) > 0 {
+			return false
+		}
+	}
+	if _, _, ok := requestLocalAuthority(r); !ok {
 		return false
 	}
 	if origin := strings.TrimSpace(r.Header.Get("Origin")); origin != "" {
-		if strings.EqualFold(origin, "null") || !isLocalBrowserOrigin(origin) {
+		if strings.EqualFold(origin, "null") || !isSameLocalBrowserAuthority(r, origin) {
 			return false
 		}
 	}
@@ -507,26 +513,85 @@ func isLoopbackRemoteAddr(remote string) bool {
 	return ip != nil && ip.IsLoopback()
 }
 
-func isLocalBrowserHost(hostPort string) bool {
-	hostPort = strings.TrimSpace(hostPort)
-	if hostPort == "" {
-		return false
+func parseLocalBrowserOrigin(raw string) (*url.URL, bool) {
+	u, err := url.Parse(raw)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" || u.User != nil || u.Path != "" || u.RawQuery != "" || u.Fragment != "" {
+		return nil, false
 	}
-	host := hostPort
-	if parsedHost, _, err := net.SplitHostPort(hostPort); err == nil {
-		host = parsedHost
-	} else {
-		host = strings.Trim(host, "[]")
+	if !isLocalHostName(u.Hostname()) {
+		return nil, false
 	}
-	return isLocalHostName(host)
+	if u.Port() != "" {
+		port, err := strconv.Atoi(u.Port())
+		if err != nil || port < 1 || port > 65535 {
+			return nil, false
+		}
+	}
+	return u, true
 }
 
-func isLocalBrowserOrigin(raw string) bool {
-	u, err := url.Parse(raw)
-	if err != nil || u.Scheme == "" || u.Host == "" || u.User != nil || u.Path != "" || u.RawQuery != "" || u.Fragment != "" {
+func isSameLocalBrowserAuthority(r *http.Request, rawOrigin string) bool {
+	u, ok := parseLocalBrowserOrigin(rawOrigin)
+	if !ok {
 		return false
 	}
-	return isLocalHostName(u.Hostname())
+	host, port, ok := requestLocalAuthority(r)
+	if !ok {
+		return false
+	}
+	originPort := u.Port()
+	if originPort == "" {
+		if u.Scheme == "https" {
+			originPort = "443"
+		} else {
+			originPort = "80"
+		}
+	}
+	return host == canonicalLocalHost(u.Hostname()) && port == originPort
+}
+
+func requestLocalAuthority(r *http.Request) (string, string, bool) {
+	hostPort := strings.TrimSpace(r.Host)
+	if hostPort == "" {
+		return "", "", false
+	}
+	host, port, ok := splitHostPortForLocal(hostPort)
+	if !ok || !isLocalHostName(host) {
+		return "", "", false
+	}
+	if port == "" {
+		if r.TLS != nil || (r.URL != nil && r.URL.Scheme == "https") {
+			port = "443"
+		} else {
+			port = "80"
+		}
+	}
+	return canonicalLocalHost(host), port, true
+}
+
+func splitHostPortForLocal(raw string) (string, string, bool) {
+	if host, port, err := net.SplitHostPort(raw); err == nil {
+		parsedPort, err := strconv.Atoi(port)
+		if err != nil || parsedPort < 1 || parsedPort > 65535 {
+			return "", "", false
+		}
+		return host, port, true
+	}
+	if strings.HasPrefix(raw, "[") && strings.HasSuffix(raw, "]") {
+		return strings.Trim(raw, "[]"), "", true
+	}
+	if strings.Count(raw, ":") == 0 {
+		return raw, "", true
+	}
+	return "", "", false
+}
+
+func canonicalLocalHost(host string) string {
+	host = strings.Trim(strings.ToLower(strings.TrimSpace(host)), "[]")
+	if ip := net.ParseIP(host); ip != nil {
+		return ip.String()
+	}
+	return host
 }
 
 func isLocalHostName(host string) bool {
@@ -708,10 +773,16 @@ func launchChromedpBrowser(parent context.Context, executable, profileDir string
 	if err := cmd.Start(); err != nil {
 		return nil, fmt.Errorf("start browser: %w", err)
 	}
-	go func() { _ = cmd.Wait() }()
+	processDone := make(chan error, 1)
+	go func() { processDone <- cmd.Wait() }()
 
 	endpoint := fmt.Sprintf("http://127.0.0.1:%d", port)
-	remoteCtx, allocCancel := chromedp.NewRemoteAllocator(parent, endpoint)
+	wsURL, err := waitForCDPWebSocketURL(parent, endpoint, processDone)
+	if err != nil {
+		stopGoogleBrowserProcess(cmd, processDone)
+		return nil, err
+	}
+	remoteCtx, allocCancel := chromedp.NewRemoteAllocator(parent, wsURL, chromedp.NoModifyURL)
 	browserCtx, browserCancel := chromedp.NewContext(remoteCtx)
 	return &chromedpGoogleBrowser{
 		ctx:           browserCtx,
@@ -719,6 +790,114 @@ func launchChromedpBrowser(parent context.Context, executable, profileDir string
 		allocCancel:   allocCancel,
 		process:       cmd,
 	}, nil
+}
+
+const (
+	googleCDPReadinessTimeout  = 12 * time.Second
+	googleCDPReadinessInterval = 75 * time.Millisecond
+)
+
+type cdpVersionResponse struct {
+	WebSocketDebuggerURL string `json:"webSocketDebuggerUrl"`
+}
+
+func newLocalCDPHTTPClient() *http.Client {
+	return &http.Client{
+		Transport: &http.Transport{Proxy: nil},
+		Timeout:   1 * time.Second,
+	}
+}
+
+func waitForCDPWebSocketURL(parent context.Context, endpoint string, processDone <-chan error) (string, error) {
+	return waitForCDPWebSocketURLWith(
+		parent,
+		endpoint,
+		processDone,
+		newLocalCDPHTTPClient(),
+		googleCDPReadinessTimeout,
+		googleCDPReadinessInterval,
+	)
+}
+
+func waitForCDPWebSocketURLWith(parent context.Context, endpoint string, processDone <-chan error, client *http.Client, timeout, interval time.Duration) (string, error) {
+	if client == nil {
+		client = newLocalCDPHTTPClient()
+	}
+	ctx, cancel := context.WithTimeout(parent, timeout)
+	defer cancel()
+
+	var processExit <-chan error
+	if processDone != nil {
+		exit := make(chan error, 1)
+		processExit = exit
+		go func() {
+			select {
+			case err := <-processDone:
+				exit <- err
+				cancel()
+			case <-ctx.Done():
+			}
+		}()
+	}
+
+	versionURL := strings.TrimRight(endpoint, "/") + "/json/version"
+	for {
+		if err := ctx.Err(); err != nil {
+			if processExit != nil {
+				select {
+				case processErr := <-processExit:
+					if processErr == nil {
+						return "", errors.New("browser process exited before CDP readiness")
+					}
+					return "", fmt.Errorf("browser process exited before CDP readiness: %w", processErr)
+				default:
+				}
+			}
+			if parent.Err() != nil {
+				return "", fmt.Errorf("CDP readiness canceled: %w", parent.Err())
+			}
+			return "", fmt.Errorf("CDP readiness timeout: %w", err)
+		}
+
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, versionURL, nil)
+		if err == nil {
+			resp, requestErr := client.Do(req)
+			if requestErr == nil {
+				var version cdpVersionResponse
+				decodeErr := json.NewDecoder(io.LimitReader(resp.Body, 64*1024)).Decode(&version)
+				resp.Body.Close()
+				if resp.StatusCode >= 200 && resp.StatusCode < 300 && decodeErr == nil && strings.TrimSpace(version.WebSocketDebuggerURL) != "" {
+					return strings.TrimSpace(version.WebSocketDebuggerURL), nil
+				}
+			} else if resp != nil && resp.Body != nil {
+				resp.Body.Close()
+			}
+		}
+
+		timer := time.NewTimer(interval)
+		select {
+		case <-timer.C:
+		case <-ctx.Done():
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+		}
+	}
+}
+
+func stopGoogleBrowserProcess(cmd *exec.Cmd, processDone <-chan error) {
+	if cmd != nil && cmd.Process != nil {
+		_ = cmd.Process.Kill()
+	}
+	if processDone != nil {
+		select {
+		case <-processDone:
+		case <-time.After(2 * time.Second):
+		}
+	}
 }
 
 func allocateLoopbackCDPPort() (int, error) {

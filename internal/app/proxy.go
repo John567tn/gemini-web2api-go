@@ -23,9 +23,10 @@ type Proxy struct {
 }
 
 var (
-	proxyMu     sync.RWMutex
-	proxyCache  []Proxy
-	proxyCursor uint64
+	proxyMu             sync.RWMutex
+	proxyCache          []Proxy
+	proxyCursor         uint64
+	metadataProxyCursor uint64
 )
 
 // loadProxies 从 DB 刷新内存里的代理列表。
@@ -281,6 +282,49 @@ func pickProxyPreferring(preferID int64) (Proxy, bool) {
 		}
 	}
 	return Proxy{}, false
+}
+
+// MetadataRoute is an observational egress selection.  It deliberately does
+// not acquire a generation slot and therefore never touches minuteWin/hourWin
+// in ratelimit.go.
+type MetadataRoute struct {
+	Proxy          Proxy
+	DirectFallback bool
+}
+
+// acquireMetadataRoute selects an egress for quota/session metadata calls.
+// It mirrors the proxy pool's affinity and fallback_direct policy without
+// consuming the generation RPM/RPH/concurrency budget.
+func acquireMetadataRoute(preferID int64) (MetadataRoute, error) {
+	proxyMu.RLock()
+	defer proxyMu.RUnlock()
+
+	if len(proxyCache) == 0 {
+		return MetadataRoute{}, nil // no proxy pool: direct is the normal route
+	}
+	now := time.Now().Unix()
+	cooldown := rtCfg().ProxyCooldownMin
+	usable := make([]Proxy, 0, len(proxyCache))
+	for _, p := range proxyCache {
+		if p.URL != "" && proxyUsable(p, now, cooldown) {
+			usable = append(usable, p)
+		}
+	}
+	if preferID > 0 {
+		for _, p := range usable {
+			if p.ID == preferID {
+				return MetadataRoute{Proxy: p}, nil
+			}
+		}
+	}
+	if len(usable) > 0 {
+		index := atomic.AddUint64(&metadataProxyCursor, 1) - 1
+		return MetadataRoute{Proxy: usable[int(index%uint64(len(usable)))]}, nil
+	}
+	if rtCfg().FallbackDirect {
+		return MetadataRoute{DirectFallback: true}, nil
+	}
+	return MetadataRoute{}, errors.New("metadata route unavailable: proxy pool has no usable proxy and fallback_direct is disabled")
 }
 
 // recordProxyResult 回写一次请求的结果，并同步更新内存里那一条。

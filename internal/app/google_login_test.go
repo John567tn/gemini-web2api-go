@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"errors"
+	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
@@ -24,8 +25,12 @@ func TestNativeGoogleLoginIsLoopbackOnly(t *testing.T) {
 		{name: "localhost same-origin", remote: "127.0.0.1:8083", host: "localhost:8083", origin: "http://localhost:8083", local: true},
 		{name: "ipv4 same-origin", remote: "127.0.0.1:8083", host: "127.0.0.1:8083", origin: "http://127.0.0.1:8083", local: true},
 		{name: "ipv6 same-origin", remote: "[::1]:8083", host: "[::1]:8083", origin: "http://[::1]:8083", local: true},
+		{name: "https same-authority", remote: "127.0.0.1:8443", host: "127.0.0.1:8443", origin: "https://127.0.0.1:8443", local: true},
 		{name: "evil origin", remote: "127.0.0.1:8083", host: "localhost:8083", origin: "https://evil.example", local: false},
 		{name: "null origin", remote: "127.0.0.1:8083", host: "localhost:8083", origin: "null", local: false},
+		{name: "localhost different port", remote: "127.0.0.1:8083", host: "localhost:8083", origin: "http://localhost:9000", local: false},
+		{name: "localhost versus ipv4", remote: "127.0.0.1:8083", host: "127.0.0.1:8083", origin: "http://localhost:8083", local: false},
+		{name: "ftp origin", remote: "127.0.0.1:8083", host: "localhost:8083", origin: "ftp://localhost:8083", local: false},
 		{name: "public host via loopback proxy", remote: "127.0.0.1:8083", host: "public.example", origin: "", local: false},
 		{name: "cross-site fetch", remote: "127.0.0.1:8083", host: "localhost:8083", fetch: "cross-site", local: false},
 		{name: "external remote", remote: "192.168.1.10:4567", host: "localhost:8083", origin: "http://localhost:8083", local: false},
@@ -62,6 +67,19 @@ func TestBrowserCookieHeaderFiltersUnrelatedDomains(t *testing.T) {
 	}
 }
 
+func TestNativeGoogleLoginRejectsForwardingHeaders(t *testing.T) {
+	for _, header := range []string{"Forwarded", "X-Forwarded-For", "X-Forwarded-Host", "X-Forwarded-Proto", "X-Real-IP"} {
+		t.Run(header, func(t *testing.T) {
+			r := httptest.NewRequest("POST", "http://localhost:8083/admin/api/google-login/start", nil)
+			r.RemoteAddr = "127.0.0.1:8083"
+			r.Header.Set(header, "remote.example")
+			if isLocalAdminRequest(r) {
+				t.Fatalf("forwarding header %s should fail closed", header)
+			}
+		})
+	}
+}
+
 func containsCookieName(cookie, name string) bool {
 	for _, pair := range splitCookiePairs(cookie) {
 		if pair[0] == name {
@@ -83,6 +101,81 @@ func TestGoogleBrowserCommandArgsAvoidAutomationSignal(t *testing.T) {
 	if !strings.Contains(joined, "--remote-debugging-port=4567") || strings.Contains(joined, "remote-debugging-port=0") {
 		t.Fatalf("browser command must use a non-zero ephemeral port: %v", args)
 	}
+}
+
+func TestCDPReadinessDelayedEndpointEventuallySucceeds(t *testing.T) {
+	var hits atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if hits.Add(1) < 3 {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		_, _ = w.Write([]byte(`{"webSocketDebuggerUrl":"ws://127.0.0.1:4567/devtools/browser/test"}`))
+	}))
+	defer server.Close()
+	wsURL, err := waitForCDPWebSocketURLWith(context.Background(), server.URL, nil, testCDPHTTPClient(), time.Second, 5*time.Millisecond)
+	if err != nil || wsURL == "" || hits.Load() < 3 {
+		t.Fatalf("delayed CDP readiness failed: ws=%q hits=%d err=%v", wsURL, hits.Load(), err)
+	}
+}
+
+func TestCDPReadinessProcessExitFailsImmediately(t *testing.T) {
+	done := make(chan error, 1)
+	done <- errors.New("browser exited")
+	started := time.Now()
+	_, err := waitForCDPWebSocketURLWith(context.Background(), "http://127.0.0.1:1", done, testCDPHTTPClient(), 10*time.Second, 5*time.Millisecond)
+	if err == nil || time.Since(started) > 500*time.Millisecond {
+		t.Fatalf("process exit was not handled immediately: elapsed=%s err=%v", time.Since(started), err)
+	}
+}
+
+func TestCDPReadinessContextExitFailsImmediately(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	started := time.Now()
+	_, err := waitForCDPWebSocketURLWith(ctx, "http://127.0.0.1:1", nil, testCDPHTTPClient(), 10*time.Second, 5*time.Millisecond)
+	if err == nil || time.Since(started) > 500*time.Millisecond {
+		t.Fatalf("context exit was not handled immediately: elapsed=%s err=%v", time.Since(started), err)
+	}
+}
+
+func TestCDPReadinessTimeoutAndMalformedResponse(t *testing.T) {
+	for _, body := range []string{"not-json", `{"webSocketDebuggerUrl":""}`} {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			_, _ = w.Write([]byte(body))
+		}))
+		started := time.Now()
+		_, err := waitForCDPWebSocketURLWith(context.Background(), server.URL, nil, testCDPHTTPClient(), 60*time.Millisecond, 5*time.Millisecond)
+		server.Close()
+		if err == nil || time.Since(started) < 50*time.Millisecond {
+			t.Fatalf("malformed endpoint did not retry until timeout: body=%q elapsed=%s err=%v", body, time.Since(started), err)
+		}
+	}
+}
+
+func TestCDPReadinessEndpointNeverAppearsTimesOut(t *testing.T) {
+	server := httptest.NewServer(http.NotFoundHandler())
+	defer server.Close()
+	started := time.Now()
+	_, err := waitForCDPWebSocketURLWith(context.Background(), server.URL, nil, testCDPHTTPClient(), 60*time.Millisecond, 5*time.Millisecond)
+	if err == nil || time.Since(started) < 50*time.Millisecond {
+		t.Fatalf("missing endpoint did not retry until timeout: elapsed=%s err=%v", time.Since(started), err)
+	}
+}
+
+func TestCDPReadinessValidWebSocketURLSucceeds(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"webSocketDebuggerUrl":"ws://127.0.0.1:4567/devtools/browser/valid"}`))
+	}))
+	defer server.Close()
+	wsURL, err := waitForCDPWebSocketURLWith(context.Background(), server.URL, nil, testCDPHTTPClient(), time.Second, 5*time.Millisecond)
+	if err != nil || wsURL != "ws://127.0.0.1:4567/devtools/browser/valid" {
+		t.Fatalf("valid CDP readiness failed: ws=%q err=%v", wsURL, err)
+	}
+}
+
+func testCDPHTTPClient() *http.Client {
+	return &http.Client{Transport: &http.Transport{Proxy: nil}}
 }
 
 func TestCleanupOrphanGoogleBrowserProfiles(t *testing.T) {

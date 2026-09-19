@@ -250,6 +250,111 @@ func TestGeminiUsageIsObservationalForAccountHealth(t *testing.T) {
 	}
 }
 
+func TestAcquireMetadataRouteAffinityAndFallbackPolicy(t *testing.T) {
+	oldProxies := proxyCache
+	oldCursor := metadataProxyCursor
+	oldRuntime := rtCfg()
+	t.Cleanup(func() {
+		proxyMu.Lock()
+		proxyCache = oldProxies
+		proxyMu.Unlock()
+		metadataProxyCursor = oldCursor
+		rtMu.Lock()
+		rtVal = oldRuntime
+		rtMu.Unlock()
+	})
+	rtMu.Lock()
+	rtVal.FallbackDirect = false
+	rtVal.ProxyCooldownMin = 0
+	rtMu.Unlock()
+	proxyMu.Lock()
+	proxyCache = []Proxy{
+		{ID: 7, URL: "http://proxy-7", Enabled: true},
+		{ID: 8, URL: "http://proxy-8", Enabled: true},
+	}
+	proxyMu.Unlock()
+
+	route, err := acquireMetadataRoute(7)
+	if err != nil || route.Proxy.ID != 7 || route.DirectFallback {
+		t.Fatalf("preferred metadata route not selected: route=%+v err=%v", route, err)
+	}
+	proxyMu.Lock()
+	proxyCache[0].Enabled = false
+	proxyMu.Unlock()
+	route, err = acquireMetadataRoute(7)
+	if err != nil || route.Proxy.ID != 8 || route.DirectFallback {
+		t.Fatalf("metadata route did not fall back to another proxy: route=%+v err=%v", route, err)
+	}
+	proxyMu.Lock()
+	proxyCache[1].Enabled = false
+	proxyMu.Unlock()
+	if route, err = acquireMetadataRoute(7); err == nil || route.Proxy.ID != 0 {
+		t.Fatalf("metadata route unexpectedly used direct with fallback disabled: route=%+v err=%v", route, err)
+	}
+	rtMu.Lock()
+	rtVal.FallbackDirect = true
+	rtMu.Unlock()
+	route, err = acquireMetadataRoute(7)
+	if err != nil || !route.DirectFallback || route.Proxy.ID != 0 {
+		t.Fatalf("metadata direct fallback policy failed: route=%+v err=%v", route, err)
+	}
+	proxyMu.Lock()
+	proxyCache = nil
+	proxyMu.Unlock()
+	route, err = acquireMetadataRoute(7)
+	if err != nil || route.DirectFallback || route.Proxy.ID != 0 {
+		t.Fatalf("no proxy pool should use normal direct metadata route: route=%+v err=%v", route, err)
+	}
+}
+
+func TestGeminiUsageDoesNotConsumeGenerationRateWindows(t *testing.T) {
+	oldProxies := proxyCache
+	oldRuntime := rtCfg()
+	oldPageFetcher := geminiUsagePageFetcher
+	oldRPCRequester := geminiUsageRPCRequester
+	t.Cleanup(func() {
+		proxyMu.Lock()
+		proxyCache = oldProxies
+		proxyMu.Unlock()
+		rtMu.Lock()
+		rtVal = oldRuntime
+		rtMu.Unlock()
+		geminiUsagePageFetcher = oldPageFetcher
+		geminiUsageRPCRequester = oldRPCRequester
+	})
+	rtMu.Lock()
+	rtVal.FallbackDirect = false
+	rtVal.ProxyCooldownMin = 0
+	rtMu.Unlock()
+	proxyMu.Lock()
+	proxyCache = []Proxy{{ID: 7, URL: "http://proxy-7", Enabled: true}}
+	proxyMu.Unlock()
+	geminiUsagePageFetcher = func(cookie, proxyURL string) ([]byte, error) {
+		if proxyURL != "http://proxy-7" {
+			t.Fatalf("usage did not preserve preferred proxy, got %q", proxyURL)
+		}
+		return []byte(`{"SNlM0e":"token-value-12345","cfb2h":"boq_assistant-bard-web-server_20260805.16_p0"}`), nil
+	}
+	raw := usageRPCFixture(t, usagePayload(
+		schemaBWindow(1, 10.0, 90.0, 1710000100),
+		schemaBWindow(2, 20.0, 80.0, 1710000200),
+	), false)
+	geminiUsageRPCRequester = func(endpoint, body string, headers map[string]string, proxyURL string, onLine func(string)) (int, []byte, int64, []string, error) {
+		return 200, raw, 0, nil, nil
+	}
+	account := CookieAccount{Cookie: "SAPISID=usage; __Secure-1PSID=usage-psid", ProxyID: 7}
+	before := slotUsage(7)
+	for i := 0; i < 3; i++ {
+		if _, err := fetchGeminiUsageLive(account); err != nil {
+			t.Fatalf("live metadata fetch %d failed: %v", i, err)
+		}
+	}
+	after := slotUsage(7)
+	if after.RPM != before.RPM || after.RPH != before.RPH || after.Inflight != before.Inflight {
+		t.Fatalf("usage changed generation rate windows: before=%+v after=%+v", before, after)
+	}
+}
+
 type fakeGoogleLoginBrowser struct {
 	cookies     []browserCookie
 	navigateErr error
