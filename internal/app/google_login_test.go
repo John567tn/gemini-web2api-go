@@ -95,6 +95,9 @@ func TestGoogleBrowserCommandArgsAvoidAutomationSignal(t *testing.T) {
 	if strings.Contains(joined, "enable-automation") {
 		t.Fatalf("browser command must not add --enable-automation: %v", args)
 	}
+	if !strings.Contains(joined, "--profile-directory=Default") || !strings.Contains(joined, googleLoginURL) {
+		t.Fatalf("browser command must select Default profile and open Gemini: %v", args)
+	}
 	if !strings.Contains(joined, "--remote-debugging-address=127.0.0.1") {
 		t.Fatalf("browser command is not loopback-bound: %v", args)
 	}
@@ -253,6 +256,56 @@ func TestNativeLoginStateMachineBrowserClosesBeforeLogin(t *testing.T) {
 	waitForProfileGone(t, s.profileDir)
 }
 
+func TestNativeLoginBrowserCandidateFallbackBeforeInteractiveLogin(t *testing.T) {
+	withFastGoogleLoginTimers(t)
+	fake := newFakeLoginBrowser()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var launches atomic.Int32
+	manager := newGoogleLoginManager(
+		func(context.Context, string, string) (googleLoginBrowser, error) {
+			if launches.Add(1) == 1 {
+				return nil, errors.New("CDP readiness timeout")
+			}
+			return fake, nil
+		},
+		func(googleSessionValidationRequest) (googleSessionValidation, error) {
+			return googleSessionValidation{}, nil
+		},
+	)
+	profileDir := filepath.Join(t.TempDir(), "profile")
+	if err := prepareGoogleBrowserProfile(profileDir); err != nil {
+		t.Fatal(err)
+	}
+	s := &googleLoginSession{
+		manager:    manager,
+		id:         "fallback-test",
+		state:      googleLoginLaunching,
+		profileDir: profileDir,
+		startedAt:  time.Now(),
+		expiresAt:  time.Now().Add(time.Minute),
+		cancel:     cancel,
+	}
+	manager.sessions[s.id] = s
+	go s.run(ctx, []browserCandidate{
+		{name: "Chrome", executable: "chrome"},
+		{name: "Edge", executable: "edge"},
+	})
+	waitForGoogleLoginState(t, s, googleLoginSucceeded)
+	if launches.Load() != 2 || fake.closeCount.Load() != 1 {
+		t.Fatalf("browser fallback did not happen cleanly: launches=%d closes=%d view=%+v", launches.Load(), fake.closeCount.Load(), s.view())
+	}
+	if attempts, ok := s.view()["attempts"].([]googleLoginAttempt); !ok || len(attempts) != 1 || attempts[0].Browser != "Chrome" || attempts[0].Failure != "cdp_readiness_timeout" {
+		t.Fatalf("browser fallback diagnostics missing: %+v", s.view())
+	}
+	if s.browserName != "Edge" {
+		t.Fatalf("fallback browser was not selected: %s", s.browserName)
+	}
+	if s.accountID > 0 {
+		_ = accountDelete(s.accountID)
+	}
+}
+
 func TestNativeLoginTransientValidatorFailureThenSuccess(t *testing.T) {
 	withFastGoogleLoginTimers(t)
 	fake := newFakeLoginBrowser()
@@ -388,7 +441,7 @@ func startMockGoogleLogin(t *testing.T, ctx context.Context, cancel context.Canc
 		cancel:     cancel,
 	}
 	manager.sessions[s.id] = s
-	go s.run(ctx, "mock-browser")
+	go s.run(ctx, []browserCandidate{{name: "Mock", executable: "mock-browser"}})
 	return s
 }
 

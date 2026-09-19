@@ -407,7 +407,7 @@ func TestGoogleLoginStateMachineUsesMockBrowser(t *testing.T) {
 	}
 	_ = os.MkdirAll(s.profileDir, 0o700)
 	m.sessions[s.id] = s
-	go s.run(ctx, "mock")
+	go s.run(ctx, []browserCandidate{{name: "Mock", executable: "mock"}})
 	deadline := time.Now().Add(time.Second)
 	for time.Now().Before(deadline) {
 		view := s.view()

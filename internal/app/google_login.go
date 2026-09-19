@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/chromedp/cdproto/network"
+	"github.com/chromedp/cdproto/target"
 	"github.com/chromedp/chromedp"
 	"github.com/google/uuid"
 )
@@ -45,6 +46,15 @@ const (
 	googleLoginFailed     = "failed"
 	googleLoginCanceled   = "canceled"
 	googleLoginExpired    = "expired"
+)
+
+const (
+	googleLoginStageBrowserStarted = "browser_process_started"
+	googleLoginStageWaitingCDP     = "waiting_for_cdp"
+	googleLoginStageCDPReady       = "cdp_ready"
+	googleLoginStageAttaching      = "attaching"
+	googleLoginStageOpeningGemini  = "opening_gemini"
+	googleLoginStageWaiting        = "waiting_for_login"
 )
 
 // browserCookie is the small, credential-bearing part of a CDP cookie.  It is
@@ -99,6 +109,9 @@ type googleLoginSession struct {
 	label       string
 	note        string
 	warning     string
+	stage       string
+	failureCode string
+	attempts    []googleLoginAttempt
 	startedAt   time.Time
 	expiresAt   time.Time
 	finishedAt  time.Time
@@ -108,6 +121,11 @@ type googleLoginSession struct {
 	cancelRequested bool
 	lastFingerprint string
 	lastValidation  time.Time
+}
+
+type googleLoginAttempt struct {
+	Browser string `json:"browser"`
+	Failure string `json:"failure"`
 }
 
 func newGoogleLoginManager(factory googleLoginBrowserFactory, validator googleSessionValidator) *googleLoginManager {
@@ -121,7 +139,7 @@ func newGoogleLoginManager(factory googleLoginBrowserFactory, validator googleSe
 var googleLogins = newGoogleLoginManager(launchChromedpBrowser, validateGoogleLoginCookie)
 
 func (m *googleLoginManager) start(label, note string, targetAccountID int64) (*googleLoginSession, error) {
-	executable, browserName, err := discoverGoogleBrowser()
+	candidates, err := discoverGoogleBrowsers()
 	if err != nil {
 		return nil, err
 	}
@@ -132,12 +150,9 @@ func (m *googleLoginManager) start(label, note string, targetAccountID int64) (*
 	id := uuid.NewString()
 	profileRoot := googleBrowserProfileRoot()
 	profileDir := filepath.Join(profileRoot, id)
-	if err := os.MkdirAll(profileDir, 0o700); err != nil {
-		return nil, fmt.Errorf("create browser profile: %w", err)
-	}
-	if err := os.WriteFile(filepath.Join(profileDir, googleLoginProfileMarker), []byte("gemini-web2api native login profile\n"), 0o600); err != nil {
+	if err := prepareGoogleBrowserProfile(profileDir); err != nil {
 		_ = os.RemoveAll(profileDir)
-		return nil, fmt.Errorf("mark browser profile: %w", err)
+		return nil, fmt.Errorf("prepare browser profile: %w", err)
 	}
 	warning := googleLoginNetworkWarning()
 	message := "正在启动受控浏览器；请只在 Google 页面中完成登录"
@@ -151,12 +166,13 @@ func (m *googleLoginManager) start(label, note string, targetAccountID int64) (*
 		id:          id,
 		state:       googleLoginLaunching,
 		message:     message,
-		browserName: browserName,
+		browserName: candidates[0].name,
 		profileDir:  profileDir,
 		accountID:   targetAccountID,
 		label:       strings.TrimSpace(label),
 		note:        strings.TrimSpace(note),
 		warning:     warning,
+		stage:       googleLoginStageBrowserStarted,
 		startedAt:   time.Now(),
 		expiresAt:   time.Now().Add(googleLoginTTL),
 		cancel:      cancel,
@@ -165,7 +181,7 @@ func (m *googleLoginManager) start(label, note string, targetAccountID int64) (*
 	m.mu.Lock()
 	m.sessions[id] = s
 	m.mu.Unlock()
-	go s.run(ctx, executable)
+	go s.run(ctx, candidates)
 	return s, nil
 }
 
@@ -189,37 +205,71 @@ func (m *googleLoginManager) remove(id string) {
 	m.mu.Unlock()
 }
 
-func (s *googleLoginSession) run(ctx context.Context, executable string) {
-	browser, err := s.manager.factory(ctx, executable, s.profileDir)
-	if err != nil {
-		s.fail("受控浏览器启动失败")
-		if cleanupErr := removeGoogleBrowserProfile(s.profileDir); cleanupErr != nil {
-			logf("[google-login] browser profile cleanup failed: %v", cleanupErr)
-			scheduleGoogleBrowserProfileCleanup(s.profileDir)
-		}
-		s.cleanupLater()
-		return
-	}
-	s.mu.Lock()
-	s.browser = browser
-	s.mu.Unlock()
+func (s *googleLoginSession) run(ctx context.Context, candidates []browserCandidate) {
+	var browser googleLoginBrowser
 	defer func() {
-		_ = browser.Close()
+		if browser != nil {
+			_ = browser.Close()
+		}
 		if err := removeGoogleBrowserProfile(s.profileDir); err != nil {
 			logf("[google-login] browser profile cleanup failed: %v", err)
 			scheduleGoogleBrowserProfileCleanup(s.profileDir)
 		}
 		s.cleanupLater()
 	}()
-
-	if err := browser.Navigate(ctx, googleLoginURL); err != nil {
-		if s.wasCanceled() {
+	for _, candidate := range candidates {
+		if ctx.Err() != nil || s.wasCanceled() {
+			if !s.wasCanceled() {
+				s.expire()
+			}
 			return
 		}
-		s.fail("无法打开 Gemini 登录页面")
+		if err := prepareGoogleBrowserProfile(s.profileDir); err != nil {
+			s.recordAttempt(candidate.name, "browser_process_exit")
+			continue
+		}
+		s.setBrowserCandidate(candidate.name)
+		s.setStage(googleLoginStageBrowserStarted, "正在启动受控浏览器")
+		s.setStage(googleLoginStageWaitingCDP, "正在等待本地 CDP 就绪")
+		candidateBrowser, err := s.manager.factory(ctx, candidate.executable, s.profileDir)
+		if err != nil {
+			s.recordAttempt(candidate.name, classifyNativeBrowserFailure(err))
+			if cleanupErr := removeGoogleBrowserProfile(s.profileDir); cleanupErr != nil {
+				scheduleGoogleBrowserProfileCleanup(s.profileDir)
+			}
+			continue
+		}
+		browser = candidateBrowser
+		s.mu.Lock()
+		s.browser = browser
+		s.mu.Unlock()
+		s.setStage(googleLoginStageCDPReady, "本地 CDP 已就绪")
+		s.setStage(googleLoginStageAttaching, "正在连接浏览器页面")
+		s.setStage(googleLoginStageOpeningGemini, "正在打开 Gemini 登录页")
+		if err := browser.Navigate(ctx, googleLoginURL); err != nil {
+			failure := classifyNativeBrowserFailure(err)
+			s.recordAttempt(candidate.name, failure)
+			_ = browser.Close()
+			browser = nil
+			s.mu.Lock()
+			s.browser = nil
+			s.mu.Unlock()
+			if cleanupErr := removeGoogleBrowserProfile(s.profileDir); cleanupErr != nil {
+				scheduleGoogleBrowserProfileCleanup(s.profileDir)
+			}
+			continue
+		}
+		s.setStage(googleLoginStageWaiting, "请在浏览器窗口中直接完成 Google 登录；程序不会读取或填写密码、2FA、Passkey")
+		break
+	}
+	if browser == nil {
+		failure := s.lastAttemptFailure()
+		if failure == "" {
+			failure = "browser_start_failed"
+		}
+		s.failWith(failure, "所有候选浏览器均无法启动或打开 Gemini")
 		return
 	}
-	s.setState(googleLoginWaiting, "请在浏览器窗口中直接完成 Google 登录；程序不会读取或填写密码、2FA、Passkey")
 
 	ticker := time.NewTicker(googleLoginPollInterval)
 	defer ticker.Stop()
@@ -239,7 +289,7 @@ func (s *googleLoginSession) run(ctx context.Context, executable string) {
 			if s.wasCanceled() {
 				return
 			}
-			s.fail("浏览器窗口已关闭或不可用")
+			s.failWith("browser_process_exit", "浏览器窗口已关闭或不可用")
 			return
 		}
 		cookie, ok := browserCookiesToHeader(cookies)
@@ -279,7 +329,7 @@ func (s *googleLoginSession) run(ctx context.Context, executable string) {
 
 		accountID, err := adoptGoogleLogin(cookie, s.accountID, s.label, s.note, validation)
 		if err != nil {
-			s.fail("Google session 已验证，但写入本地账号池失败")
+			s.failWith("account_adopt_failed", "Google session 已验证，但写入本地账号池失败")
 			return
 		}
 		_ = browser.Close()
@@ -298,6 +348,52 @@ func (s *googleLoginSession) setState(state, message string) {
 	s.message = message
 }
 
+func (s *googleLoginSession) setStage(stage, message string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if isGoogleLoginTerminal(s.state) {
+		return
+	}
+	s.stage = stage
+	s.message = message
+}
+
+func (s *googleLoginSession) setBrowserCandidate(name string) {
+	s.mu.Lock()
+	s.browserName = name
+	s.mu.Unlock()
+}
+
+func (s *googleLoginSession) recordAttempt(browser, failure string) {
+	s.mu.Lock()
+	s.attempts = append(s.attempts, googleLoginAttempt{Browser: browser, Failure: failure})
+	s.mu.Unlock()
+	logf("[google-login] browser candidate %s failed: %s", browser, failure)
+}
+
+func (s *googleLoginSession) lastAttemptFailure() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if len(s.attempts) == 0 {
+		return ""
+	}
+	return s.attempts[len(s.attempts)-1].Failure
+}
+
+func (s *googleLoginSession) failWith(code, message string) {
+	s.mu.Lock()
+	if isGoogleLoginTerminal(s.state) {
+		s.mu.Unlock()
+		return
+	}
+	s.state = googleLoginFailed
+	s.stage = code
+	s.failureCode = code
+	s.message = message
+	s.finishedAt = time.Now()
+	s.mu.Unlock()
+}
+
 func (s *googleLoginSession) succeed(accountID int64, warning string) {
 	s.mu.Lock()
 	if isGoogleLoginTerminal(s.state) {
@@ -312,18 +408,6 @@ func (s *googleLoginSession) succeed(accountID int64, warning string) {
 		s.message += "；警告：" + warning
 	}
 	s.accountID = accountID
-	s.finishedAt = time.Now()
-	s.mu.Unlock()
-}
-
-func (s *googleLoginSession) fail(message string) {
-	s.mu.Lock()
-	if isGoogleLoginTerminal(s.state) {
-		s.mu.Unlock()
-		return
-	}
-	s.state = googleLoginFailed
-	s.message = message
 	s.finishedAt = time.Now()
 	s.mu.Unlock()
 }
@@ -384,6 +468,9 @@ func (s *googleLoginSession) view() map[string]interface{} {
 		"browser":    s.browserName,
 		"account_id": s.accountID,
 		"warning":    s.warning,
+		"stage":      s.stage,
+		"failure":    s.failureCode,
+		"attempts":   append([]googleLoginAttempt(nil), s.attempts...),
 		"started_at": s.startedAt.UTC().Format(time.RFC3339),
 		"expires_at": s.expiresAt.UTC().Format(time.RFC3339),
 		"finished_at": func() string {
@@ -629,6 +716,34 @@ func removeGoogleBrowserProfile(profileDir string) error {
 	return err
 }
 
+func prepareGoogleBrowserProfile(profileDir string) error {
+	if err := os.MkdirAll(profileDir, 0o700); err != nil {
+		return err
+	}
+	return os.WriteFile(filepath.Join(profileDir, googleLoginProfileMarker), []byte("gemini-web2api native login profile\n"), 0o600)
+}
+
+func classifyNativeBrowserFailure(err error) string {
+	if err == nil {
+		return ""
+	}
+	message := strings.ToLower(err.Error())
+	switch {
+	case strings.Contains(message, "browser process exited"), strings.Contains(message, "start browser"):
+		return "browser_process_exit"
+	case strings.Contains(message, "cdp readiness timeout"):
+		return "cdp_readiness_timeout"
+	case strings.Contains(message, "cdp attach"):
+		return "cdp_attach_failed"
+	case strings.Contains(message, "no_normal_page_target"):
+		return "no_normal_page_target"
+	case strings.Contains(message, "gemini navigation"):
+		return "gemini_navigation_failed"
+	default:
+		return "browser_start_failed"
+	}
+}
+
 func scheduleGoogleBrowserProfileCleanup(profileDir string) {
 	if profileDir == "" {
 		return
@@ -687,11 +802,20 @@ func cleanupOrphanGoogleBrowserProfiles(root string, now time.Time) int {
 }
 
 type browserCandidate struct {
-	name  string
-	paths []string
+	name       string
+	executable string
+	paths      []string
 }
 
 func discoverGoogleBrowser() (string, string, error) {
+	candidates, err := discoverGoogleBrowsers()
+	if err != nil {
+		return "", "", err
+	}
+	return candidates[0].executable, candidates[0].name, nil
+}
+
+func discoverGoogleBrowsers() ([]browserCandidate, error) {
 	var candidates []browserCandidate
 	switch runtime.GOOS {
 	case "windows":
@@ -731,6 +855,7 @@ func discoverGoogleBrowser() (string, string, error) {
 			{name: "Chromium", paths: []string{"chromium", "chromium-browser"}},
 		}
 	}
+	var resolved []browserCandidate
 	for _, candidate := range candidates {
 		for _, path := range candidate.paths {
 			if path == "" {
@@ -738,22 +863,28 @@ func discoverGoogleBrowser() (string, string, error) {
 			}
 			if filepath.IsAbs(path) {
 				if info, err := os.Stat(path); err == nil && !info.IsDir() {
-					return path, candidate.name, nil
+					resolved = append(resolved, browserCandidate{name: candidate.name, executable: path})
+					break
 				}
 				continue
 			}
-			if found, err := exec.LookPath(path); err == nil {
-				return found, candidate.name, nil
+			if executable, err := exec.LookPath(path); err == nil {
+				resolved = append(resolved, browserCandidate{name: candidate.name, executable: executable})
+				break
 			}
 		}
 	}
-	return "", "", errors.New("找不到可用的 Chrome/Edge/Chromium 浏览器；请先安装桌面浏览器")
+	if len(resolved) == 0 {
+		return nil, errors.New("找不到可用的 Chrome/Edge/Chromium 浏览器；请先安装桌面浏览器")
+	}
+	return resolved, nil
 }
 
 type chromedpGoogleBrowser struct {
 	ctx           context.Context
 	browserCancel context.CancelFunc
 	allocCancel   context.CancelFunc
+	targetCancel  context.CancelFunc
 	process       *exec.Cmd
 	closeOnce     sync.Once
 }
@@ -916,15 +1047,79 @@ func allocateLoopbackCDPPort() (int, error) {
 func googleBrowserCommandArgs(profileDir string, port int) []string {
 	return []string{
 		"--user-data-dir=" + profileDir,
+		"--profile-directory=Default",
 		"--remote-debugging-address=127.0.0.1",
 		fmt.Sprintf("--remote-debugging-port=%d", port),
 		"--no-first-run",
 		"--no-default-browser-check",
+		googleLoginURL,
 	}
 }
 
 func (b *chromedpGoogleBrowser) Navigate(ctx context.Context, target string) error {
-	return chromedp.Run(b.ctx, chromedp.Navigate(target), chromedp.WaitReady("body", chromedp.ByQuery))
+	if err := b.selectNormalPageTarget(target); err != nil {
+		return fmt.Errorf("no_normal_page_target: %w", err)
+	}
+	var current string
+	if err := chromedp.Run(b.ctx, chromedp.Location(&current)); err != nil {
+		return fmt.Errorf("cdp_attach_failed: %w", err)
+	}
+	if isGeminiAppURL(current) {
+		if err := chromedp.Run(b.ctx, chromedp.WaitReady("body", chromedp.ByQuery)); err != nil {
+			return fmt.Errorf("gemini navigation failed: %w", err)
+		}
+		return nil
+	}
+	if err := chromedp.Run(b.ctx, chromedp.Navigate(target), chromedp.WaitReady("body", chromedp.ByQuery)); err != nil {
+		return fmt.Errorf("gemini navigation failed: %w", err)
+	}
+	return nil
+}
+
+func (b *chromedpGoogleBrowser) selectNormalPageTarget(geminiURL string) error {
+	if b.targetCancel != nil {
+		return nil
+	}
+	targets, err := chromedp.Targets(b.ctx)
+	if err != nil {
+		return fmt.Errorf("cdp attach: %w", err)
+	}
+	var preferred, normal *target.Info
+	for _, info := range targets {
+		if info == nil || info.Type != "page" {
+			continue
+		}
+		if strings.HasPrefix(strings.ToLower(info.URL), "chrome://profile-picker") {
+			_ = target.CloseTarget(info.TargetID).Do(b.ctx)
+			continue
+		}
+		if isGeminiAppURL(info.URL) {
+			preferred = info
+			break
+		}
+		if normal == nil {
+			normal = info
+		}
+	}
+	selected := preferred
+	if selected == nil {
+		selected = normal
+	}
+	if selected == nil {
+		id, createErr := target.CreateTarget(geminiURL).Do(b.ctx)
+		if createErr != nil {
+			return fmt.Errorf("create normal page: %w", createErr)
+		}
+		selected = &target.Info{TargetID: id, Type: "page", URL: geminiURL}
+	}
+	pageCtx, cancel := chromedp.NewContext(b.ctx, chromedp.WithTargetID(selected.TargetID))
+	b.ctx = pageCtx
+	b.targetCancel = cancel
+	return nil
+}
+
+func isGeminiAppURL(raw string) bool {
+	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(raw)), strings.ToLower(googleLoginURL))
 }
 
 func (b *chromedpGoogleBrowser) Cookies(ctx context.Context) ([]browserCookie, error) {
@@ -941,6 +1136,9 @@ func (b *chromedpGoogleBrowser) Cookies(ctx context.Context) ([]browserCookie, e
 
 func (b *chromedpGoogleBrowser) Close() error {
 	b.closeOnce.Do(func() {
+		if b.targetCancel != nil {
+			b.targetCancel()
+		}
 		b.browserCancel()
 		b.allocCancel()
 		if b.process != nil && b.process.Process != nil {
