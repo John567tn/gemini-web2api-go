@@ -191,6 +191,34 @@ func TestCDPReadinessValidWebSocketURLSucceeds(t *testing.T) {
 	}
 }
 
+func TestBrowserCDPAttachRetryTransientThenSuccess(t *testing.T) {
+	var attempts atomic.Int32
+	err := retryBrowserConnection(context.Background(), func(context.Context) error {
+		if attempts.Add(1) < 3 {
+			return errors.New("could not dial websocket")
+		}
+		return nil
+	}, time.Second, time.Millisecond)
+	if err != nil || attempts.Load() != 3 {
+		t.Fatalf("browser attach retry failed: attempts=%d err=%v", attempts.Load(), err)
+	}
+}
+
+func TestBrowserCDPAttachRetryHonorsTimeoutAndParent(t *testing.T) {
+	started := time.Now()
+	err := retryBrowserConnection(context.Background(), func(context.Context) error {
+		return errors.New("could not dial websocket")
+	}, 40*time.Millisecond, time.Millisecond)
+	if err == nil || time.Since(started) < 30*time.Millisecond {
+		t.Fatalf("browser attach timeout not enforced: elapsed=%s err=%v", time.Since(started), err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := retryBrowserConnection(ctx, func(context.Context) error { return errors.New("could not dial websocket") }, time.Second, time.Millisecond); err == nil {
+		t.Fatal("browser attach retry ignored canceled parent")
+	}
+}
+
 func testCDPHTTPClient() *http.Client {
 	return &http.Client{Transport: &http.Transport{Proxy: nil}}
 }

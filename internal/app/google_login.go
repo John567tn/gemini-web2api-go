@@ -255,6 +255,7 @@ func (s *googleLoginSession) run(ctx context.Context, candidates []browserCandid
 		s.setStage(googleLoginStageOpeningGemini, "正在准备 Gemini 登录页")
 		prepareErr := browser.PrepareLoginPage(ctx, googleLoginURL)
 		if prepareErr != nil {
+			logf("[google-login] page preparation warning browser=%s type=%T detail=%s", candidate.name, prepareErr, safeNativeBrowserError(prepareErr))
 			s.addWarning(candidate.name + "：login_page_prepare_failed；如果 Gemini 页面未自动打开，请在此浏览器窗口手动进入 gemini.google.com")
 			s.setStage(googleLoginStageWaiting, "Chrome 已连接；如果 Gemini 页面未自动打开，请在此浏览器窗口手动进入 gemini.google.com")
 		} else {
@@ -286,6 +287,7 @@ func (s *googleLoginSession) run(ctx context.Context, candidates []browserCandid
 
 		cookies, err := browser.Cookies(ctx)
 		if err != nil {
+			logf("[google-login] browser-level cookie polling failed type=%T detail=%s", err, safeNativeBrowserError(err))
 			if s.wasCanceled() {
 				return
 			}
@@ -998,6 +1000,8 @@ func absoluteGoogleBrowserProfileDir(profileDir string) (string, error) {
 const (
 	googleCDPReadinessTimeout  = 12 * time.Second
 	googleCDPReadinessInterval = 75 * time.Millisecond
+	googleCDPAttachTimeout     = 10 * time.Second
+	googleCDPAttachInterval    = 100 * time.Millisecond
 )
 
 type cdpVersionResponse struct {
@@ -1129,9 +1133,50 @@ func googleBrowserCommandArgs(profileDir string, port int) []string {
 }
 
 func (b *chromedpGoogleBrowser) EnsureBrowserConnected(ctx context.Context) error {
-	targets, err := chromedp.Targets(b.browserCtx)
-	b.logTargetSnapshot("T1=browser_connected", targets)
+	// Derive retry contexts from browserCtx, not the plain login context.  The
+	// chromedp Context value must survive so Targets() can use its Allocator /
+	// cancel state; browserCtx itself is already parented to the login context.
+	err := retryBrowserConnection(b.browserCtx, func(context.Context) error {
+		// Do not pass the retry child context to RemoteAllocator.  Its first
+		// successful Allocate binds the websocket lifecycle to that context;
+		// canceling the retry child would tear down the otherwise healthy browser.
+		targets, err := chromedp.Targets(b.browserCtx)
+		if err == nil {
+			b.logTargetSnapshot("T1=browser_connected", targets)
+		}
+		return err
+	}, googleCDPAttachTimeout, googleCDPAttachInterval)
 	return err
+}
+
+func retryBrowserConnection(parent context.Context, attempt func(context.Context) error, timeout, interval time.Duration) error {
+	ctx, cancel := context.WithTimeout(parent, timeout)
+	defer cancel()
+	var lastErr error
+	for {
+		if err := ctx.Err(); err != nil {
+			if lastErr != nil {
+				return fmt.Errorf("browser CDP attach timeout: %w", lastErr)
+			}
+			return err
+		}
+		if err := attempt(ctx); err == nil {
+			return nil
+		} else {
+			lastErr = err
+		}
+		timer := time.NewTimer(interval)
+		select {
+		case <-timer.C:
+		case <-ctx.Done():
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+		}
+	}
 }
 
 func (b *chromedpGoogleBrowser) PrepareLoginPage(ctx context.Context, geminiURL string) error {
