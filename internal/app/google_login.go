@@ -227,12 +227,12 @@ func (s *googleLoginSession) run(ctx context.Context, candidates []browserCandid
 			return
 		}
 		if err := prepareGoogleBrowserProfile(s.profileDir); err != nil {
-			s.recordAttempt(candidate.name, "browser_process_exit")
+			s.recordAttempt(candidate.name, "browser_process_exit", err)
 			continue
 		}
 		candidateProfileDir := filepath.Join(s.profileDir, strings.ToLower(candidate.name))
 		if err := prepareGoogleBrowserProfile(candidateProfileDir); err != nil {
-			s.recordAttempt(candidate.name, "browser_process_exit")
+			s.recordAttempt(candidate.name, "browser_process_exit", err)
 			continue
 		}
 		s.setBrowserCandidate(candidate.name)
@@ -240,7 +240,7 @@ func (s *googleLoginSession) run(ctx context.Context, candidates []browserCandid
 		s.setStage(googleLoginStageWaitingCDP, "正在等待本地 CDP 就绪")
 		candidateBrowser, err := s.manager.factory(ctx, candidate.executable, candidateProfileDir)
 		if err != nil {
-			s.recordAttempt(candidate.name, classifyNativeBrowserFailure(err))
+			s.recordAttempt(candidate.name, classifyNativeBrowserFailure(err), err)
 			if cleanupErr := removeGoogleBrowserProfile(candidateProfileDir); cleanupErr != nil {
 				scheduleGoogleBrowserProfileCleanup(candidateProfileDir)
 			}
@@ -364,11 +364,15 @@ func (s *googleLoginSession) setBrowserCandidate(name string) {
 	s.mu.Unlock()
 }
 
-func (s *googleLoginSession) recordAttempt(browser, failure string) {
+func (s *googleLoginSession) recordAttempt(browser, failure string, details ...error) {
 	s.mu.Lock()
 	s.attempts = append(s.attempts, googleLoginAttempt{Browser: browser, Failure: failure})
 	s.mu.Unlock()
-	logf("[google-login] browser candidate %s failed: %s", browser, failure)
+	detail := ""
+	if len(details) > 0 && details[0] != nil {
+		detail = fmt.Sprintf(" type=%T detail=%s", details[0], safeNativeBrowserError(details[0]))
+	}
+	logf("[google-login] browser candidate %s failed: %s%s", browser, failure, detail)
 }
 
 func (s *googleLoginSession) addWarning(warning string) {
@@ -750,6 +754,37 @@ func classifyNativeBrowserFailure(err error) string {
 	}
 }
 
+func safeNativeBrowserError(err error) string {
+	if err == nil {
+		return ""
+	}
+	message := err.Error()
+	for _, token := range []string{"SAPISID", "SNlM0e", "__Secure-1PSID", "__Secure-1PSIDTS", "Cookie"} {
+		if strings.Contains(message, token) {
+			return "[redacted]"
+		}
+	}
+	if index := strings.Index(message, "ws://"); index >= 0 {
+		message = message[:index] + "ws://<redacted>"
+	}
+	if index := strings.Index(message, "wss://"); index >= 0 {
+		message = message[:index] + "wss://<redacted>"
+	}
+	return truncate(message, 300)
+}
+
+func safeBrowserCommandArgs(args []string) string {
+	cleaned := make([]string, 0, len(args))
+	for _, arg := range args {
+		if strings.HasPrefix(arg, "--user-data-dir=") {
+			cleaned = append(cleaned, "--user-data-dir=<profile>")
+			continue
+		}
+		cleaned = append(cleaned, arg)
+	}
+	return strings.Join(cleaned, " ")
+}
+
 func scheduleGoogleBrowserProfileCleanup(profileDir string) {
 	if profileDir == "" {
 		return
@@ -905,20 +940,36 @@ func launchChromedpBrowser(parent context.Context, executable, profileDir string
 	if err != nil {
 		return nil, err
 	}
-	cmd := exec.CommandContext(parent, executable, googleBrowserCommandArgs(profileDir, port)...)
+	absoluteProfileDir, err := absoluteGoogleBrowserProfileDir(profileDir)
+	if err != nil {
+		return nil, fmt.Errorf("resolve browser profile: %w", err)
+	}
+	cmd := exec.CommandContext(parent, executable, googleBrowserCommandArgs(absoluteProfileDir, port)...)
 	cmd.Stdout = io.Discard
 	cmd.Stderr = io.Discard
 	if err := cmd.Start(); err != nil {
 		return nil, fmt.Errorf("start browser: %w", err)
 	}
+	logf("[google-login] browser process started executable=%s pid=%d args=%s", filepath.Base(executable), cmd.Process.Pid, safeBrowserCommandArgs(googleBrowserCommandArgs(profileDir, port)))
 	processDone := make(chan error, 1)
-	go func() { processDone <- cmd.Wait() }()
+	go func() {
+		err := cmd.Wait()
+		exitCode := 0
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			exitCode = exitErr.ExitCode()
+		}
+		logf("[google-login] browser process exit executable=%s pid=%d exit_code=%d err=%s", filepath.Base(executable), cmd.Process.Pid, exitCode, safeNativeBrowserError(err))
+		processDone <- err
+	}()
 
 	endpoint := fmt.Sprintf("http://127.0.0.1:%d", port)
 	wsURL, err := waitForCDPWebSocketURL(parent, endpoint, processDone)
 	if err != nil {
 		stopGoogleBrowserProcess(cmd, processDone)
 		return nil, err
+	}
+	if ws, parseErr := url.Parse(wsURL); parseErr == nil {
+		logf("[google-login] CDP ready executable=%s pid=%d ws=%s://%s:%s/devtools/browser/<redacted>", filepath.Base(executable), cmd.Process.Pid, ws.Scheme, ws.Hostname(), ws.Port())
 	}
 	remoteCtx, allocCancel := chromedp.NewRemoteAllocator(parent, wsURL, chromedp.NoModifyURL)
 	browserCtx, browserCancel := chromedp.NewContext(remoteCtx)
@@ -933,7 +984,15 @@ func launchChromedpBrowser(parent context.Context, executable, profileDir string
 		_ = browser.Close()
 		return nil, fmt.Errorf("cdp_attach_failed: %w", err)
 	}
+	logf("[google-login] browser connected executable=%s pid=%d", filepath.Base(executable), cmd.Process.Pid)
 	return browser, nil
+}
+
+func absoluteGoogleBrowserProfileDir(profileDir string) (string, error) {
+	if profileDir == "" {
+		return "", errors.New("browser profile directory is empty")
+	}
+	return filepath.Abs(profileDir)
 }
 
 const (
@@ -1070,11 +1129,15 @@ func googleBrowserCommandArgs(profileDir string, port int) []string {
 }
 
 func (b *chromedpGoogleBrowser) EnsureBrowserConnected(ctx context.Context) error {
-	_, err := chromedp.Targets(b.browserCtx)
+	targets, err := chromedp.Targets(b.browserCtx)
+	b.logTargetSnapshot("T1=browser_connected", targets)
 	return err
 }
 
 func (b *chromedpGoogleBrowser) PrepareLoginPage(ctx context.Context, geminiURL string) error {
+	if targets, err := chromedp.Targets(b.browserCtx); err == nil {
+		b.logTargetSnapshot("T2=prepare_before", targets)
+	}
 	if err := b.selectNormalPageTarget(geminiURL); err != nil {
 		return fmt.Errorf("no_normal_page_target: %w", err)
 	}
@@ -1083,10 +1146,16 @@ func (b *chromedpGoogleBrowser) PrepareLoginPage(ctx context.Context, geminiURL 
 		return fmt.Errorf("page target unavailable: %w", err)
 	}
 	if isGeminiAppURL(current) || isGoogleSigninURL(current) {
+		if targets, err := chromedp.Targets(b.browserCtx); err == nil {
+			b.logTargetSnapshot("T3=prepare_after", targets)
+		}
 		return nil
 	}
 	if err := chromedp.Run(b.ctx, chromedp.Navigate(geminiURL), chromedp.WaitReady("body", chromedp.ByQuery)); err != nil {
 		return fmt.Errorf("gemini navigation failed: %w", err)
+	}
+	if targets, err := chromedp.Targets(b.browserCtx); err == nil {
+		b.logTargetSnapshot("T3=prepare_after", targets)
 	}
 	return nil
 }
@@ -1099,6 +1168,7 @@ func (b *chromedpGoogleBrowser) selectNormalPageTarget(geminiURL string) error {
 	if err != nil {
 		return fmt.Errorf("cdp attach: %w", err)
 	}
+	b.logTargetSnapshot("T2=target_selection", targets)
 	var preferred, normal *target.Info
 	for _, info := range targets {
 		if info == nil || info.Type != "page" {
@@ -1131,6 +1201,42 @@ func (b *chromedpGoogleBrowser) selectNormalPageTarget(geminiURL string) error {
 	b.ctx = pageCtx
 	b.targetCancel = cancel
 	return nil
+}
+
+func (b *chromedpGoogleBrowser) logTargetSnapshot(phase string, targets []*target.Info) {
+	parts := make([]string, 0, len(targets))
+	for _, info := range targets {
+		if info == nil {
+			continue
+		}
+		id := string(info.TargetID)
+		if len(id) > 8 {
+			id = id[:8]
+		}
+		parts = append(parts, fmt.Sprintf("id=%s type=%s url=%s title=%s attached=%t", id, info.Type, safeTargetURL(info.URL), safeTargetTitle(info.Title), info.Attached))
+	}
+	logf("[google-login] targets phase=%s count=%d %s", phase, len(parts), strings.Join(parts, " | "))
+}
+
+func safeTargetURL(raw string) string {
+	if raw == "" {
+		return ""
+	}
+	if strings.HasPrefix(raw, "about:") || strings.HasPrefix(raw, "chrome:") {
+		return strings.SplitN(raw, "?", 2)[0]
+	}
+	u, err := url.Parse(raw)
+	if err != nil || !u.IsAbs() {
+		return truncate(strings.SplitN(raw, "?", 2)[0], 160)
+	}
+	return u.Scheme + "://" + u.Host + u.Path
+}
+
+func safeTargetTitle(title string) string {
+	if strings.Contains(title, "@") {
+		return "<redacted>"
+	}
+	return truncate(title, 120)
 }
 
 func isGeminiAppURL(raw string) bool {

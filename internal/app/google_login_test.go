@@ -106,6 +106,20 @@ func TestGoogleBrowserCommandArgsAvoidAutomationSignal(t *testing.T) {
 	}
 }
 
+func TestGoogleBrowserLaunchNormalizesRelativeProfilePath(t *testing.T) {
+	profile, err := absoluteGoogleBrowserProfileDir(filepath.Join("data", "browser-profiles", "session", "chrome"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !filepath.IsAbs(profile) {
+		t.Fatalf("profile path was not normalized to absolute: %q", profile)
+	}
+	args := googleBrowserCommandArgs(profile, 4567)
+	if !strings.Contains(strings.Join(args, " "), "--user-data-dir="+profile) {
+		t.Fatalf("normalized profile path not passed to browser: %v", args)
+	}
+}
+
 func TestCDPReadinessDelayedEndpointEventuallySucceeds(t *testing.T) {
 	var hits atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
